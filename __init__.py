@@ -6,10 +6,12 @@ import bpy
 import gpu
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty
 from gpu_extras.batch import batch_for_shader
+from mathutils.kdtree import KDTree
 
 
 _UV_EPS = 1.0e-7
 _FACTOR_EPS = 1.0e-6
+_POINT_SNAP_RADIUS_PX = 18.0
 
 
 def _cross2(a, b):
@@ -563,9 +565,13 @@ def _draw_batch_knife(operator):
     )
     shader.bind()
     line_color = (
-        (0.1, 0.65, 1.0, 1.0)
-        if operator._snap_active
-        else (1.0, 0.25, 0.05, 0.95)
+        (0.15, 1.0, 0.35, 1.0)
+        if operator._point_snap_hit
+        else (
+            (0.1, 0.65, 1.0, 1.0)
+            if operator._snap_active
+            else (1.0, 0.25, 0.05, 0.95)
+        )
     )
     shader.uniform_float("color", line_color)
     line_batch.draw(shader)
@@ -615,7 +621,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
     extend_line: BoolProperty(
         name="Extend Line",
         description="Treat the drawn segment as an infinite line",
-        default=True,
+        default=False,
     )
     split_uv_islands: BoolProperty(
         name="Split UV Islands",
@@ -656,7 +662,14 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _pixel_end = None
     _pixel_raw_end = None
     _axis_lock = None
+    _active_axis = None
     _snap_active = False
+    _point_snap_enabled = False
+    _point_snap_hit = False
+    _current_snap_uv = None
+    _start_snap_uv = None
+    _snap_tree = None
+    _snap_points = None
     _cursor_is_modal = False
     _stage = 0
 
@@ -694,6 +707,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
         if self._cursor_is_modal and context.window is not None:
             context.window.cursor_modal_restore()
             self._cursor_is_modal = False
+        self._snap_tree = None
+        self._snap_points = None
         if context.area is not None:
             context.area.tag_redraw()
         if context.workspace is not None:
@@ -701,6 +716,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
     def _constrained_point(self, point, nearest_axis=False):
         if self._pixel_start is None:
+            self._active_axis = None
             self._snap_active = False
             return point
 
@@ -710,6 +726,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
             delta_y = point[1] - self._pixel_start[1]
             axis = "X" if abs(delta_x) >= abs(delta_y) else "Y"
 
+        self._active_axis = axis
         self._snap_active = axis is not None
         if axis == "X":
             return point[0], self._pixel_start[1]
@@ -717,26 +734,121 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return self._pixel_start[0], point[1]
         return point
 
+    def _build_point_snap_cache(self, context):
+        self._snap_tree = None
+        self._snap_points = []
+        seen = set()
+        region = context.region
+        radius = _POINT_SNAP_RADIUS_PX
+        sync_selection = context.scene.tool_settings.use_uv_select_sync
+
+        for obj in _edit_mesh_objects(context):
+            mesh = obj.data
+            active_uv = mesh.uv_layers.active
+            if active_uv is None:
+                continue
+            bm = bmesh.from_edit_mesh(mesh)
+            uv_layer = bm.loops.layers.uv.get(active_uv.name)
+            if uv_layer is None:
+                continue
+
+            if self.target_mode == "SELECTED_UV":
+                faces = (
+                    face for face in bm.faces
+                    if _selected_mesh_face(face)
+                )
+            else:
+                faces = (
+                    face for face in bm.faces
+                    if _visible_uv_face(face, sync_selection)
+                )
+
+            for face in faces:
+                for loop in face.loops:
+                    uv_data = loop[uv_layer].uv
+                    uv = (float(uv_data.x), float(uv_data.y))
+                    key = (round(uv[0], 8), round(uv[1], 8))
+                    if key in seen:
+                        continue
+                    pixel = region.view2d.view_to_region(
+                        uv[0],
+                        uv[1],
+                        clip=False,
+                    )
+                    if (
+                        pixel[0] < -radius
+                        or pixel[0] > region.width + radius
+                        or pixel[1] < -radius
+                        or pixel[1] > region.height + radius
+                    ):
+                        continue
+                    seen.add(key)
+                    self._snap_points.append(
+                        ((float(pixel[0]), float(pixel[1])), uv)
+                    )
+
+        if self._snap_points:
+            tree = KDTree(len(self._snap_points))
+            for index, (pixel, _uv) in enumerate(self._snap_points):
+                tree.insert((pixel[0], pixel[1], 0.0), index)
+            tree.balance()
+            self._snap_tree = tree
+
+    def _update_pointer(self, context, point, nearest_axis=False):
+        constrained = self._constrained_point(
+            point,
+            nearest_axis=nearest_axis,
+        )
+        self._point_snap_hit = False
+        self._current_snap_uv = None
+
+        if (
+            self._point_snap_enabled
+            and self._active_axis is None
+            and self._snap_tree is not None
+        ):
+            coordinate, index, distance = self._snap_tree.find(
+                (constrained[0], constrained[1], 0.0)
+            )
+            if distance <= _POINT_SNAP_RADIUS_PX:
+                pixel, uv = self._snap_points[index]
+                self._point_snap_hit = True
+                self._snap_active = True
+                self._current_snap_uv = uv
+                return pixel
+        return constrained
+
     def _set_status_text(self, context):
         lock_text = ""
         if self._axis_lock == "X":
             lock_text = " | X: горизонталь зафиксирована"
         elif self._axis_lock == "Y":
             lock_text = " | Y: вертикаль зафиксирована"
+        line_text = "бесконечная" if self.extend_line else "от точки до точки"
+        snap_text = "ВКЛ" if self._point_snap_enabled else "ВЫКЛ"
         context.workspace.status_text_set(
-            "UV Batch Knife: ЛКМ — точки; Ctrl — ближайшая ось; "
-            "X/Y — фиксация оси; ПКМ/Esc — отмена"
+            f"UV Batch Knife: линия {line_text}; S: снап к точкам {snap_text}; "
+            "C — тип линии; Ctrl — ближайшая ось; X/Y — фиксация оси; "
+            "ПКМ/Esc — отмена"
             + lock_text
         )
 
     def invoke(self, context, event):
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
+        self.extend_line = False
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
         self._pixel_raw_end = self._pixel_end
         self._axis_lock = None
+        self._active_axis = None
         self._snap_active = False
+        self._point_snap_enabled = False
+        self._point_snap_hit = False
+        self._current_snap_uv = None
+        self._start_snap_uv = None
+        self._snap_tree = None
+        self._snap_points = None
         self._cursor_is_modal = False
         self._stage = 0
         self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
@@ -766,10 +878,30 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
         if event.type == "MOUSEMOVE":
             self._pixel_raw_end = (event.mouse_region_x, event.mouse_region_y)
-            self._pixel_end = self._constrained_point(
+            self._pixel_end = self._update_pointer(
+                context,
                 self._pixel_raw_end,
                 nearest_axis=event.ctrl,
             )
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "S" and event.value == "PRESS":
+            self._point_snap_enabled = not self._point_snap_enabled
+            if self._point_snap_enabled and self._snap_tree is None:
+                self._build_point_snap_cache(context)
+            self._pixel_end = self._update_pointer(
+                context,
+                self._pixel_raw_end,
+                nearest_axis=False,
+            )
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "C" and event.value == "PRESS":
+            self.extend_line = not self.extend_line
+            self._set_status_text(context)
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
 
@@ -781,7 +913,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
             self._axis_lock = (
                 None if self._axis_lock == event.type else event.type
             )
-            self._pixel_end = self._constrained_point(
+            self._pixel_end = self._update_pointer(
+                context,
                 self._pixel_raw_end,
                 nearest_axis=False,
             )
@@ -790,25 +923,44 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            point = (event.mouse_region_x, event.mouse_region_y)
+            raw_point = (event.mouse_region_x, event.mouse_region_y)
             if self._stage == 0:
+                self._pixel_raw_end = raw_point
+                point = self._update_pointer(
+                    context,
+                    raw_point,
+                    nearest_axis=False,
+                )
                 self._pixel_start = point
                 self._pixel_end = point
-                self._pixel_raw_end = point
+                self._start_snap_uv = self._current_snap_uv
                 self._stage = 1
                 context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
 
-            self._pixel_raw_end = point
-            self._pixel_end = self._constrained_point(
-                point,
+            self._pixel_raw_end = raw_point
+            self._pixel_end = self._update_pointer(
+                context,
+                raw_point,
                 nearest_axis=event.ctrl,
             )
             if _dist_sq(self._pixel_end, self._pixel_start) < 16.0:
                 return {"RUNNING_MODAL"}
 
-            start_uv = context.region.view2d.region_to_view(*self._pixel_start)
-            end_uv = context.region.view2d.region_to_view(*self._pixel_end)
+            start_uv = (
+                self._start_snap_uv
+                if self._start_snap_uv is not None
+                else context.region.view2d.region_to_view(*self._pixel_start)
+            )
+            end_uv = (
+                self._current_snap_uv
+                if self._current_snap_uv is not None
+                else context.region.view2d.region_to_view(*self._pixel_end)
+            )
+            if self._active_axis == "X":
+                end_uv = (end_uv[0], start_uv[1])
+            elif self._active_axis == "Y":
+                end_uv = (start_uv[0], end_uv[1])
             self.start_uv = start_uv
             self.end_uv = end_uv
             self._finish_modal(context)
