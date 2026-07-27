@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "uv_batch_knife"
+version = "1.0.0"
+name = "UV Batch Knife"
+tagline = "Cut overlapping UV islands with one UV-space line"
+maintainer = "OpenAI Codex"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[build]
+paths = [
+  "__init__.py",
+  "README.md",
+]
