@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.blend1
+*.blend2
+
+# Release archives are published as GitHub Release assets.
+/releases/

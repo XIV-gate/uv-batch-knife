@@ -20,6 +20,20 @@ from mathutils.kdtree import KDTree
 _UV_EPS = 1.0e-7
 _FACTOR_EPS = 1.0e-6
 _POINT_SNAP_RADIUS_PX = 18.0
+_SNAP_MODES = (
+    "OFF",
+    "POINTS",
+    "UV_GRID",
+    "EDGE_CENTERS",
+    "FACE_CENTERS",
+)
+_SNAP_MODE_LABELS = {
+    "OFF": "S0 OFF",
+    "POINTS": "S1 UV Points",
+    "UV_GRID": "S2 UV Grid",
+    "EDGE_CENTERS": "S3 Edge Centers",
+    "FACE_CENTERS": "S4 Face Centers",
+}
 
 
 def _cross2(a, b):
@@ -34,6 +48,23 @@ def _dist_sq(a, b):
     x = a[0] - b[0]
     y = a[1] - b[1]
     return x * x + y * y
+
+
+def _nice_grid_step(value):
+    """Round a positive UV spacing to a readable 1/2/5 decade."""
+    value = max(float(value), _UV_EPS)
+    exponent = math.floor(math.log10(value))
+    scale = 10.0 ** exponent
+    normalized = value / scale
+    if normalized <= 1.0:
+        factor = 1.0
+    elif normalized <= 2.0:
+        factor = 2.0
+    elif normalized <= 5.0:
+        factor = 5.0
+    else:
+        factor = 10.0
+    return factor * scale
 
 
 def _signed_distance(point, origin, direction):
@@ -1154,11 +1185,17 @@ def _draw_batch_knife(operator):
             f" | Cell {cell_size:.4f} UV"
             f" | Angle {angle_degrees:.1f}°"
             + step_text
+            + f" | {operator._snap_mode_label(context)}"
         )
         blf.position(0, end[0] + 14.0, end[1] + 14.0, 0.0)
         blf.size(0, 14.0)
         blf.color(0, 1.0, 1.0, 1.0, 1.0)
         blf.draw(0, label)
+    elif operator._stage == 1:
+        blf.position(0, end[0] + 14.0, end[1] + 14.0, 0.0)
+        blf.size(0, 14.0)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(0, operator._snap_mode_label(context))
 
     gpu.state.line_width_set(1.0)
     gpu.state.point_size_set(1.0)
@@ -1272,12 +1309,14 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _axis_lock = None
     _active_axis = None
     _snap_active = False
-    _point_snap_enabled = False
+    _snap_mode = "OFF"
     _point_snap_hit = False
     _current_snap_uv = None
     _start_snap_uv = None
     _snap_tree = None
     _snap_points = None
+    _snap_caches = None
+    _current_grid_snap_step = None
     _grid_segments_pixel = ()
     _grid_preview_size = 0.0
     _grid_preview_angle = 0.0
@@ -1327,6 +1366,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
             self._cursor_is_modal = False
         self._snap_tree = None
         self._snap_points = None
+        self._snap_caches = {}
+        self._current_grid_snap_step = None
         if context.area is not None:
             context.area.tag_redraw()
         if context.workspace is not None:
@@ -1352,9 +1393,77 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return self._pixel_start[0], point[1]
         return point
 
-    def _build_point_snap_cache(self, context):
+    def _uv_grid_snap_steps(self, context):
+        uv_editor = getattr(context.space_data, "uv_editor", None)
+        grid_source = (
+            getattr(uv_editor, "grid_shape_source", "DYNAMIC")
+            if uv_editor is not None
+            else "DYNAMIC"
+        )
+
+        if grid_source == "FIXED":
+            subdivisions = getattr(
+                uv_editor,
+                "custom_grid_subdivisions",
+                (10, 10),
+            )
+            step_x = 1.0 / max(1, int(subdivisions[0]))
+            step_y = 1.0 / max(1, int(subdivisions[1]))
+            return step_x, step_y
+
+        if grid_source == "PIXEL":
+            image = getattr(context.space_data, "image", None)
+            image_size = getattr(image, "size", None)
+            if (
+                image_size is not None
+                and len(image_size) >= 2
+                and image_size[0] > 0
+                and image_size[1] > 0
+            ):
+                return 1.0 / image_size[0], 1.0 / image_size[1]
+
+        region = context.region
+        view2d = region.view2d
+        bottom_left = view2d.region_to_view(0.0, 0.0)
+        top_right = view2d.region_to_view(
+            float(region.width),
+            float(region.height),
+        )
+        uv_per_pixel = max(
+            abs(top_right[0] - bottom_left[0]) / max(1, region.width),
+            abs(top_right[1] - bottom_left[1]) / max(1, region.height),
+        )
+        dynamic_step = _nice_grid_step(uv_per_pixel * 32.0)
+        return dynamic_step, dynamic_step
+
+    def _snap_mode_label(self, context):
+        label = _SNAP_MODE_LABELS.get(self._snap_mode, "S0 OFF")
+        if self._snap_mode != "UV_GRID":
+            return label
+        steps = self._current_grid_snap_step
+        if steps is None:
+            steps = self._uv_grid_snap_steps(context)
+        if abs(steps[0] - steps[1]) <= _UV_EPS:
+            return f"{label} ({steps[0]:.6g} UV)"
+        return f"{label} ({steps[0]:.6g} x {steps[1]:.6g} UV)"
+
+    def _build_snap_cache(self, context):
         self._snap_tree = None
         self._snap_points = []
+        if self._snap_mode not in {
+            "POINTS",
+            "EDGE_CENTERS",
+            "FACE_CENTERS",
+        }:
+            return
+
+        if self._snap_caches is None:
+            self._snap_caches = {}
+        cached = self._snap_caches.get(self._snap_mode)
+        if cached is not None:
+            self._snap_tree, self._snap_points = cached
+            return
+
         seen = set()
         region = context.region
         radius = _POINT_SNAP_RADIUS_PX
@@ -1382,9 +1491,34 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 )
 
             for face in faces:
-                for loop in face.loops:
-                    uv_data = loop[uv_layer].uv
-                    uv = (float(uv_data.x), float(uv_data.y))
+                if self._snap_mode == "POINTS":
+                    candidates = (
+                        (
+                            float(loop[uv_layer].uv.x),
+                            float(loop[uv_layer].uv.y),
+                        )
+                        for loop in face.loops
+                    )
+                elif self._snap_mode == "EDGE_CENTERS":
+                    candidates = (
+                        (
+                            (
+                                float(loop[uv_layer].uv.x)
+                                + float(loop.link_loop_next[uv_layer].uv.x)
+                            )
+                            * 0.5,
+                            (
+                                float(loop[uv_layer].uv.y)
+                                + float(loop.link_loop_next[uv_layer].uv.y)
+                            )
+                            * 0.5,
+                        )
+                        for loop in face.loops
+                    )
+                else:
+                    candidates = (_face_uv_centroid(face, uv_layer),)
+
+                for uv in candidates:
                     key = (round(uv[0], 8), round(uv[1], 8))
                     if key in seen:
                         continue
@@ -1411,6 +1545,10 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 tree.insert((pixel[0], pixel[1], 0.0), index)
             tree.balance()
             self._snap_tree = tree
+        self._snap_caches[self._snap_mode] = (
+            self._snap_tree,
+            self._snap_points,
+        )
 
     def _update_pointer(self, context, point, nearest_axis=False):
         constrained = self._constrained_point(
@@ -1420,12 +1558,30 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._point_snap_hit = False
         self._current_snap_uv = None
 
+        if self._snap_mode == "UV_GRID" and self._active_axis is None:
+            step_x, step_y = self._uv_grid_snap_steps(context)
+            self._current_grid_snap_step = (step_x, step_y)
+            uv = context.region.view2d.region_to_view(*constrained)
+            snapped_uv = (
+                round(uv[0] / step_x) * step_x,
+                round(uv[1] / step_y) * step_y,
+            )
+            pixel = context.region.view2d.view_to_region(
+                snapped_uv[0],
+                snapped_uv[1],
+                clip=False,
+            )
+            self._point_snap_hit = True
+            self._snap_active = True
+            self._current_snap_uv = snapped_uv
+            return float(pixel[0]), float(pixel[1])
+
         if (
-            self._point_snap_enabled
+            self._snap_mode in {"POINTS", "EDGE_CENTERS", "FACE_CENTERS"}
             and self._active_axis is None
             and self._snap_tree is not None
         ):
-            coordinate, index, distance = self._snap_tree.find(
+            _coordinate, index, distance = self._snap_tree.find(
                 (constrained[0], constrained[1], 0.0)
             )
             if distance <= _POINT_SNAP_RADIUS_PX:
@@ -1532,13 +1688,14 @@ class UV_OT_batch_knife(bpy.types.Operator):
         )
 
     def _set_status_text(self, context):
+        snap_text = self._snap_mode_label(context)
         if self.cut_mode == "GRID":
-            snap_text = "ВКЛ" if self._point_snap_enabled else "ВЫКЛ"
             context.workspace.status_text_set(
                 f"UV Grid Knife: {self.grid_subdivisions} x "
                 f"{self.grid_subdivisions}; колесо — подразделения; "
                 f"Ctrl — угол 15°; Alt — шаг размера 0.1 UV; "
-                f"S: снап {snap_text}; G — режим линии; ПКМ/Esc — отмена"
+                f"S — режим снапа: {snap_text}; "
+                f"G — режим линии; ПКМ/Esc — отмена"
             )
             return
 
@@ -1548,9 +1705,9 @@ class UV_OT_batch_knife(bpy.types.Operator):
         elif self._axis_lock == "Y":
             lock_text = " | Y: вертикаль зафиксирована"
         line_text = "бесконечная" if self.extend_line else "от точки до точки"
-        snap_text = "ВКЛ" if self._point_snap_enabled else "ВЫКЛ"
         context.workspace.status_text_set(
-            f"UV Batch Knife: линия {line_text}; S: снап к точкам {snap_text}; "
+            f"UV Batch Knife: линия {line_text}; "
+            f"S — режим снапа: {snap_text}; "
             "C — тип линии; Ctrl — ближайшая ось; X/Y — фиксация оси; "
             "G — режим грида; ПКМ/Esc — отмена"
             + lock_text
@@ -1568,12 +1725,14 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._axis_lock = None
         self._active_axis = None
         self._snap_active = False
-        self._point_snap_enabled = False
+        self._snap_mode = "OFF"
         self._point_snap_hit = False
         self._current_snap_uv = None
         self._start_snap_uv = None
         self._snap_tree = None
         self._snap_points = None
+        self._snap_caches = {}
+        self._current_grid_snap_step = None
         self._grid_segments_pixel = ()
         self._grid_preview_size = 0.0
         self._grid_preview_angle = 0.0
@@ -1624,9 +1783,19 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         if event.type == "S" and event.value == "PRESS":
-            self._point_snap_enabled = not self._point_snap_enabled
-            if self._point_snap_enabled and self._snap_tree is None:
-                self._build_point_snap_cache(context)
+            snap_index = _SNAP_MODES.index(self._snap_mode)
+            self._snap_mode = _SNAP_MODES[
+                (snap_index + 1) % len(_SNAP_MODES)
+            ]
+            self._snap_tree = None
+            self._snap_points = None
+            self._current_grid_snap_step = None
+            if self._snap_mode in {
+                "POINTS",
+                "EDGE_CENTERS",
+                "FACE_CENTERS",
+            }:
+                self._build_snap_cache(context)
             if self.cut_mode == "GRID" and self._stage == 1:
                 self._update_grid_preview(
                     context,
