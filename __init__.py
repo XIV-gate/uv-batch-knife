@@ -1,10 +1,18 @@
+import math
 import time
 from collections import deque
 
 import bmesh
+import blf
 import bpy
 import gpu
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+)
 from gpu_extras.batch import batch_for_shader
 from mathutils.kdtree import KDTree
 
@@ -516,6 +524,534 @@ def _cut_object(
     }
 
 
+def _grid_axes(angle):
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    return (cosine, sine), (-sine, cosine)
+
+
+def _grid_local(point, center, axis_x, axis_y):
+    relative = _sub2(point, center)
+    return (
+        relative[0] * axis_x[0] + relative[1] * axis_x[1],
+        relative[0] * axis_y[0] + relative[1] * axis_y[1],
+    )
+
+
+def _grid_world(local, center, axis_x, axis_y):
+    return (
+        center[0] + axis_x[0] * local[0] + axis_y[0] * local[1],
+        center[1] + axis_x[1] * local[0] + axis_y[1] * local[1],
+    )
+
+
+def _orientation(a, b, c):
+    return _cross2(_sub2(b, a), _sub2(c, a))
+
+
+def _segments_intersect(a, b, c, d):
+    ab_c = _orientation(a, b, c)
+    ab_d = _orientation(a, b, d)
+    cd_a = _orientation(c, d, a)
+    cd_b = _orientation(c, d, b)
+    return (
+        min(ab_c, ab_d) <= _UV_EPS
+        and max(ab_c, ab_d) >= -_UV_EPS
+        and min(cd_a, cd_b) <= _UV_EPS
+        and max(cd_a, cd_b) >= -_UV_EPS
+    )
+
+
+def _face_grid_local_polygon(face, uv_layer, center, axis_x, axis_y):
+    return [
+        _grid_local(
+            (loop[uv_layer].uv.x, loop[uv_layer].uv.y),
+            center,
+            axis_x,
+            axis_y,
+        )
+        for loop in face.loops
+    ]
+
+
+def _face_overlaps_grid(face, uv_layer, center, axis_x, axis_y, half_size):
+    polygon = _face_grid_local_polygon(
+        face,
+        uv_layer,
+        center,
+        axis_x,
+        axis_y,
+    )
+    if not polygon:
+        return False
+
+    minimum_x = min(point[0] for point in polygon)
+    maximum_x = max(point[0] for point in polygon)
+    minimum_y = min(point[1] for point in polygon)
+    maximum_y = max(point[1] for point in polygon)
+    if (
+        maximum_x < -half_size
+        or minimum_x > half_size
+        or maximum_y < -half_size
+        or minimum_y > half_size
+    ):
+        return False
+
+    if any(
+        -half_size - _UV_EPS <= point[0] <= half_size + _UV_EPS
+        and -half_size - _UV_EPS <= point[1] <= half_size + _UV_EPS
+        for point in polygon
+    ):
+        return True
+
+    corners = (
+        (-half_size, -half_size),
+        (half_size, -half_size),
+        (half_size, half_size),
+        (-half_size, half_size),
+    )
+    if any(_point_in_polygon(corner, polygon) for corner in corners):
+        return True
+
+    square_edges = tuple(
+        (corners[index], corners[(index + 1) % 4])
+        for index in range(4)
+    )
+    for index, point in enumerate(polygon):
+        next_point = polygon[(index + 1) % len(polygon)]
+        if any(
+            _segments_intersect(point, next_point, edge_a, edge_b)
+            for edge_a, edge_b in square_edges
+        ):
+            return True
+    return False
+
+
+def _face_inside_grid(face, uv_layer, center, axis_x, axis_y, half_size):
+    centroid = _face_uv_centroid(face, uv_layer)
+    local = _grid_local(centroid, center, axis_x, axis_y)
+    return (
+        -half_size - _UV_EPS <= local[0] <= half_size + _UV_EPS
+        and -half_size - _UV_EPS <= local[1] <= half_size + _UV_EPS
+    )
+
+
+def _face_fully_inside_grid(
+    face,
+    uv_layer,
+    center,
+    axis_x,
+    axis_y,
+    half_size,
+):
+    polygon = _face_grid_local_polygon(
+        face,
+        uv_layer,
+        center,
+        axis_x,
+        axis_y,
+    )
+    return bool(polygon) and all(
+        -half_size - _UV_EPS <= point[0] <= half_size + _UV_EPS
+        and -half_size - _UV_EPS <= point[1] <= half_size + _UV_EPS
+        for point in polygon
+    )
+
+
+def _scope_faces(bm, uv_layer, target_mode, sync_selection):
+    if target_mode == "SELECTED_UV":
+        return [
+            face
+            for face in bm.faces
+            if _selected_mesh_face(face)
+        ]
+    return [
+        face
+        for face in bm.faces
+        if _visible_uv_face(face, sync_selection)
+    ]
+
+
+def _cut_face_set_with_line(
+    bm,
+    uv_layer,
+    target_faces,
+    origin,
+    direction,
+    *,
+    extend_line,
+):
+    valid_faces = {
+        face for face in target_faces
+        if face.is_valid and len(face.loops) >= 3
+    }
+    edge_cut_buckets = {}
+    face_records = []
+    for face in valid_faces:
+        record = _collect_face_cut(
+            face,
+            uv_layer,
+            origin,
+            direction,
+            extend_line,
+            edge_cut_buckets,
+        )
+        if record is not None:
+            face_records.append(record)
+
+    new_vertices = _split_requested_edges(edge_cut_buckets)
+    all_target_faces = set(valid_faces)
+    cut_edges, cut_faces = _connect_face_pairs(
+        face_records,
+        uv_layer,
+        all_target_faces,
+        mark_seams=False,
+    )
+    return {
+        "cut_edges": cut_edges,
+        "cut_faces": cut_faces,
+        "new_vertices": new_vertices,
+        "target_faces": all_target_faces,
+    }
+
+
+def _edge_uv_pair(edge, uv_layer):
+    for face in edge.link_faces:
+        loop = _loop_for_edge(face, edge)
+        if loop is None:
+            continue
+        next_loop = loop.link_loop_next
+        return (
+            (loop[uv_layer].uv.x, loop[uv_layer].uv.y),
+            (next_loop[uv_layer].uv.x, next_loop[uv_layer].uv.y),
+        )
+    return None
+
+
+def _cut_grid_object(
+    obj,
+    center,
+    size,
+    angle,
+    subdivisions,
+    *,
+    target_mode,
+    split_uv_islands,
+    separation,
+    mark_seams,
+    sync_selection,
+):
+    mesh = obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    active_uv = mesh.uv_layers.active
+    if active_uv is None:
+        return {
+            "object": obj.name,
+            "target_faces": 0,
+            "cut_faces": 0,
+            "cut_edges": 0,
+            "new_vertices": 0,
+        }
+
+    uv_layer = bm.loops.layers.uv.get(active_uv.name)
+    if uv_layer is None:
+        return {
+            "object": obj.name,
+            "target_faces": 0,
+            "cut_faces": 0,
+            "cut_edges": 0,
+            "new_vertices": 0,
+        }
+
+    tag_name = "_uv_batch_knife_grid"
+    tag_layer = bm.edges.layers.int.get(tag_name)
+    if tag_layer is None:
+        tag_layer = bm.edges.layers.int.new(tag_name)
+    for edge in bm.edges:
+        edge[tag_layer] = 0
+
+    axis_x, axis_y = _grid_axes(angle)
+    half_size = size * 0.5
+    target_faces = _scope_faces(
+        bm,
+        uv_layer,
+        target_mode,
+        sync_selection,
+    )
+    initial_target_count = len(target_faces)
+    current_faces = {
+        face
+        for face in target_faces
+        if _face_overlaps_grid(
+            face,
+            uv_layer,
+            center,
+            axis_x,
+            axis_y,
+            half_size,
+        )
+    }
+
+    total_new_vertices = 0
+    touched_faces = set()
+    boundary_lines = (
+        (
+            _grid_world((-half_size, 0.0), center, axis_x, axis_y),
+            axis_y,
+        ),
+        (
+            _grid_world((half_size, 0.0), center, axis_x, axis_y),
+            axis_y,
+        ),
+        (
+            _grid_world((0.0, -half_size), center, axis_x, axis_y),
+            axis_x,
+        ),
+        (
+            _grid_world((0.0, half_size), center, axis_x, axis_y),
+            axis_x,
+        ),
+    )
+
+    for line_origin, line_direction in boundary_lines:
+        candidates = {
+            face
+            for face in current_faces
+            if face.is_valid
+            and _face_overlaps_grid(
+                face,
+                uv_layer,
+                center,
+                axis_x,
+                axis_y,
+                half_size,
+            )
+        }
+        result = _cut_face_set_with_line(
+            bm,
+            uv_layer,
+            candidates,
+            line_origin,
+            line_direction,
+            extend_line=True,
+        )
+        for edge in result["cut_edges"]:
+            edge[tag_layer] = 1
+        current_faces.update(result["target_faces"])
+        touched_faces.update(result["cut_faces"])
+        total_new_vertices += result["new_vertices"]
+
+    tolerance = max(_UV_EPS * 10.0, size * 1.0e-6)
+    outside_boundary_edges = []
+    for edge in tuple(bm.edges):
+        if not edge.is_valid or edge[tag_layer] != 1:
+            continue
+        uv_pair = _edge_uv_pair(edge, uv_layer)
+        if uv_pair is None:
+            continue
+        local_a = _grid_local(uv_pair[0], center, axis_x, axis_y)
+        local_b = _grid_local(uv_pair[1], center, axis_x, axis_y)
+        midpoint = (
+            (local_a[0] + local_b[0]) * 0.5,
+            (local_a[1] + local_b[1]) * 0.5,
+        )
+
+        on_vertical = (
+            (
+                abs(local_a[0] + half_size) <= tolerance
+                and abs(local_b[0] + half_size) <= tolerance
+            )
+            or (
+                abs(local_a[0] - half_size) <= tolerance
+                and abs(local_b[0] - half_size) <= tolerance
+            )
+        )
+        on_horizontal = (
+            (
+                abs(local_a[1] + half_size) <= tolerance
+                and abs(local_b[1] + half_size) <= tolerance
+            )
+            or (
+                abs(local_a[1] - half_size) <= tolerance
+                and abs(local_b[1] - half_size) <= tolerance
+            )
+        )
+        inside_segment = (
+            on_vertical
+            and -half_size - tolerance <= midpoint[1] <= half_size + tolerance
+        ) or (
+            on_horizontal
+            and -half_size - tolerance <= midpoint[0] <= half_size + tolerance
+        )
+        if (on_vertical or on_horizontal) and not inside_segment:
+            outside_boundary_edges.append(edge)
+
+    for edge in outside_boundary_edges:
+        if edge.is_valid:
+            edge[tag_layer] = 0
+            bmesh.ops.dissolve_edges(
+                bm,
+                edges=[edge],
+                use_verts=False,
+                use_face_split=False,
+            )
+
+    current_faces = {
+        face
+        for face in _scope_faces(
+            bm,
+            uv_layer,
+            target_mode,
+            sync_selection,
+        )
+        if face.is_valid
+        and _face_fully_inside_grid(
+            face,
+            uv_layer,
+            center,
+            axis_x,
+            axis_y,
+            half_size,
+        )
+    }
+
+    cell_size = size / subdivisions
+    internal_lines = []
+    for index in range(1, subdivisions):
+        offset = -half_size + cell_size * index
+        internal_lines.append(
+            (
+                _grid_world((offset, 0.0), center, axis_x, axis_y),
+                axis_y,
+            )
+        )
+        internal_lines.append(
+            (
+                _grid_world((0.0, offset), center, axis_x, axis_y),
+                axis_x,
+            )
+        )
+
+    for line_origin, line_direction in internal_lines:
+        candidates = {
+            face
+            for face in current_faces
+            if face.is_valid
+            and _face_fully_inside_grid(
+                face,
+                uv_layer,
+                center,
+                axis_x,
+                axis_y,
+                half_size,
+            )
+        }
+        result = _cut_face_set_with_line(
+            bm,
+            uv_layer,
+            candidates,
+            line_origin,
+            line_direction,
+            extend_line=True,
+        )
+        for edge in result["cut_edges"]:
+            edge[tag_layer] = 2
+        current_faces.update(result["target_faces"])
+        touched_faces.update(result["cut_faces"])
+        total_new_vertices += result["new_vertices"]
+
+    grid_edges = {
+        edge
+        for edge in bm.edges
+        if edge.is_valid and edge[tag_layer] > 0
+    }
+    if mark_seams:
+        for edge in grid_edges:
+            edge.seam = True
+            edge.select = True
+
+    if split_uv_islands and grid_edges and separation > 0.0:
+        inside_faces = [
+            face
+            for face in _scope_faces(
+                bm,
+                uv_layer,
+                target_mode,
+                sync_selection,
+            )
+            if face.is_valid
+            and _face_fully_inside_grid(
+                face,
+                uv_layer,
+                center,
+                axis_x,
+                axis_y,
+                half_size,
+            )
+        ]
+        for face in inside_faces:
+            local = _grid_local(
+                _face_uv_centroid(face, uv_layer),
+                center,
+                axis_x,
+                axis_y,
+            )
+            column = min(
+                subdivisions - 1,
+                max(0, int((local[0] + half_size) / cell_size)),
+            )
+            row = min(
+                subdivisions - 1,
+                max(0, int((local[1] + half_size) / cell_size)),
+            )
+            shift_x = separation * (column + 1)
+            shift_y = separation * (row + 1)
+            world_shift = (
+                axis_x[0] * shift_x + axis_y[0] * shift_y,
+                axis_x[1] * shift_x + axis_y[1] * shift_y,
+            )
+            for loop in face.loops:
+                loop[uv_layer].uv.x += world_shift[0]
+                loop[uv_layer].uv.y += world_shift[1]
+
+    cut_edge_count = len(grid_edges)
+    cut_face_count = len({face for face in touched_faces if face.is_valid})
+    bm.select_flush_mode()
+    bm.edges.layers.int.remove(tag_layer)
+
+    if cut_edge_count:
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+
+    return {
+        "object": obj.name,
+        "target_faces": initial_target_count,
+        "cut_faces": cut_face_count,
+        "cut_edges": cut_edge_count,
+        "new_vertices": total_new_vertices,
+    }
+
+
+def _grid_uv_segments(center, size, angle, subdivisions):
+    axis_x, axis_y = _grid_axes(angle)
+    half_size = size * 0.5
+    segments = []
+    for index in range(subdivisions + 1):
+        offset = -half_size + size * index / subdivisions
+        segments.append(
+            (
+                _grid_world((offset, -half_size), center, axis_x, axis_y),
+                _grid_world((offset, half_size), center, axis_x, axis_y),
+            )
+        )
+        segments.append(
+            (
+                _grid_world((-half_size, offset), center, axis_x, axis_y),
+                _grid_world((half_size, offset), center, axis_x, axis_y),
+            )
+        )
+    return segments
+
+
 def _extended_preview_points(start, end):
     dx = end[0] - start[0]
     dy = end[1] - start[1]
@@ -549,20 +1085,10 @@ def _draw_batch_knife(operator):
 
     if end is None:
         end = start
-    line_start, line_end = (
-        _extended_preview_points(start, end)
-        if operator.extend_line
-        else (start, end)
-    )
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
     gpu.state.line_width_set(2.0)
-    line_batch = batch_for_shader(
-        shader,
-        "LINES",
-        {"pos": (line_start, line_end)},
-    )
     shader.bind()
     line_color = (
         (0.15, 1.0, 0.35, 1.0)
@@ -573,8 +1099,32 @@ def _draw_batch_knife(operator):
             else (1.0, 0.25, 0.05, 0.95)
         )
     )
-    shader.uniform_float("color", line_color)
-    line_batch.draw(shader)
+
+    if operator.cut_mode == "GRID":
+        positions = []
+        for segment_start, segment_end in operator._grid_segments_pixel:
+            positions.extend((segment_start, segment_end))
+        if positions:
+            grid_batch = batch_for_shader(
+                shader,
+                "LINES",
+                {"pos": positions},
+            )
+            shader.uniform_float("color", line_color)
+            grid_batch.draw(shader)
+    else:
+        line_start, line_end = (
+            _extended_preview_points(start, end)
+            if operator.extend_line
+            else (start, end)
+        )
+        line_batch = batch_for_shader(
+            shader,
+            "LINES",
+            {"pos": (line_start, line_end)},
+        )
+        shader.uniform_float("color", line_color)
+        line_batch.draw(shader)
 
     gpu.state.point_size_set(7.0)
     point_positions = [start]
@@ -587,6 +1137,29 @@ def _draw_batch_knife(operator):
     )
     shader.uniform_float("color", (1.0, 0.7, 0.1, 1.0))
     point_batch.draw(shader)
+
+    if (
+        operator.cut_mode == "GRID"
+        and operator._grid_preview_size > _UV_EPS
+    ):
+        cell_size = (
+            operator._grid_preview_size / operator.grid_subdivisions
+        )
+        angle_degrees = math.degrees(operator._grid_preview_angle)
+        step_text = " | STEP 0.1" if operator._grid_step_active else ""
+        label = (
+            f"{operator.grid_subdivisions} x "
+            f"{operator.grid_subdivisions}"
+            f" | Size {operator._grid_preview_size:.4f} UV"
+            f" | Cell {cell_size:.4f} UV"
+            f" | Angle {angle_degrees:.1f}°"
+            + step_text
+        )
+        blf.position(0, end[0] + 14.0, end[1] + 14.0, 0.0)
+        blf.size(0, 14.0)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(0, label)
+
     gpu.state.line_width_set(1.0)
     gpu.state.point_size_set(1.0)
     gpu.state.blend_set("NONE")
@@ -617,6 +1190,15 @@ class UV_OT_batch_knife(bpy.types.Operator):
             ),
         ),
         default="VISIBLE",
+    )
+    cut_mode: EnumProperty(
+        name="Cut Mode",
+        description="Cut with one line or with a square grid",
+        items=(
+            ("LINE", "Line", "Cut with one line"),
+            ("GRID", "Grid", "Cut everything inside a square grid"),
+        ),
+        default="LINE",
     )
     extend_line: BoolProperty(
         name="Extend Line",
@@ -654,6 +1236,32 @@ class UV_OT_batch_knife(bpy.types.Operator):
         size=2,
         options={"HIDDEN", "SKIP_SAVE"},
     )
+    grid_center_uv: FloatVectorProperty(
+        name="Grid Center",
+        size=2,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    grid_size: FloatProperty(
+        name="Grid Size",
+        description="Square side length in UV units",
+        default=0.5,
+        min=0.000001,
+        soft_max=2.0,
+        precision=5,
+    )
+    grid_angle: FloatProperty(
+        name="Grid Angle",
+        description="Grid rotation in UV space",
+        default=0.0,
+        subtype="ANGLE",
+    )
+    grid_subdivisions: IntProperty(
+        name="Grid Subdivisions",
+        description="Equal number of square cells horizontally and vertically",
+        default=2,
+        min=1,
+        max=64,
+    )
 
     _draw_handle = None
     _area = None
@@ -670,6 +1278,10 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _start_snap_uv = None
     _snap_tree = None
     _snap_points = None
+    _grid_segments_pixel = ()
+    _grid_preview_size = 0.0
+    _grid_preview_angle = 0.0
+    _grid_step_active = False
     _cursor_is_modal = False
     _stage = 0
 
@@ -688,8 +1300,14 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, "cut_mode")
         layout.prop(self, "target_mode")
-        layout.prop(self, "extend_line")
+        if self.cut_mode == "GRID":
+            layout.prop(self, "grid_size")
+            layout.prop(self, "grid_angle")
+            layout.prop(self, "grid_subdivisions")
+        else:
+            layout.prop(self, "extend_line")
         layout.separator()
         layout.prop(self, "split_uv_islands")
         sub = layout.column()
@@ -818,7 +1436,112 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 return pixel
         return constrained
 
+    def _update_grid_preview(
+        self,
+        context,
+        point,
+        *,
+        snap_angle=False,
+        step_size=False,
+    ):
+        snapped_pixel = self._update_pointer(
+            context,
+            point,
+            nearest_axis=False,
+        )
+        if self._pixel_start is None:
+            self._pixel_end = snapped_pixel
+            return
+
+        center_uv = (
+            self._start_snap_uv
+            if self._start_snap_uv is not None
+            else context.region.view2d.region_to_view(*self._pixel_start)
+        )
+        corner_uv = (
+            self._current_snap_uv
+            if self._current_snap_uv is not None
+            else context.region.view2d.region_to_view(*snapped_pixel)
+        )
+        delta = _sub2(corner_uv, center_uv)
+        radius = math.hypot(delta[0], delta[1])
+        if radius <= _UV_EPS:
+            self._grid_preview_size = 0.0
+            self._grid_segments_pixel = ()
+            self._pixel_end = snapped_pixel
+            return
+
+        corner_angle = math.atan2(delta[1], delta[0])
+        grid_angle = corner_angle - math.pi * 0.25
+        if snap_angle:
+            angle_step = math.radians(15.0)
+            grid_angle = round(grid_angle / angle_step) * angle_step
+
+        size = radius * math.sqrt(2.0)
+        if step_size:
+            size = max(0.1, round(size / 0.1) * 0.1)
+        size = max(size, 0.000001)
+
+        final_corner_angle = grid_angle + math.pi * 0.25
+        final_radius = size / math.sqrt(2.0)
+        final_corner_uv = (
+            center_uv[0] + math.cos(final_corner_angle) * final_radius,
+            center_uv[1] + math.sin(final_corner_angle) * final_radius,
+        )
+        final_corner_pixel = context.region.view2d.view_to_region(
+            final_corner_uv[0],
+            final_corner_uv[1],
+            clip=False,
+        )
+        self._pixel_end = (
+            float(final_corner_pixel[0]),
+            float(final_corner_pixel[1]),
+        )
+        self._grid_preview_size = size
+        self._grid_preview_angle = grid_angle
+        self._grid_step_active = step_size
+        if snap_angle or step_size:
+            self._point_snap_hit = False
+
+        segments = _grid_uv_segments(
+            center_uv,
+            size,
+            grid_angle,
+            self.grid_subdivisions,
+        )
+        self._grid_segments_pixel = tuple(
+            (
+                tuple(
+                    float(value)
+                    for value in context.region.view2d.view_to_region(
+                        segment_start[0],
+                        segment_start[1],
+                        clip=False,
+                    )
+                ),
+                tuple(
+                    float(value)
+                    for value in context.region.view2d.view_to_region(
+                        segment_end[0],
+                        segment_end[1],
+                        clip=False,
+                    )
+                ),
+            )
+            for segment_start, segment_end in segments
+        )
+
     def _set_status_text(self, context):
+        if self.cut_mode == "GRID":
+            snap_text = "ВКЛ" if self._point_snap_enabled else "ВЫКЛ"
+            context.workspace.status_text_set(
+                f"UV Grid Knife: {self.grid_subdivisions} x "
+                f"{self.grid_subdivisions}; колесо — подразделения; "
+                f"Ctrl — угол 15°; Alt — шаг размера 0.1 UV; "
+                f"S: снап {snap_text}; G — режим линии; ПКМ/Esc — отмена"
+            )
+            return
+
         lock_text = ""
         if self._axis_lock == "X":
             lock_text = " | X: горизонталь зафиксирована"
@@ -829,14 +1552,16 @@ class UV_OT_batch_knife(bpy.types.Operator):
         context.workspace.status_text_set(
             f"UV Batch Knife: линия {line_text}; S: снап к точкам {snap_text}; "
             "C — тип линии; Ctrl — ближайшая ось; X/Y — фиксация оси; "
-            "ПКМ/Esc — отмена"
+            "G — режим грида; ПКМ/Esc — отмена"
             + lock_text
         )
 
     def invoke(self, context, event):
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
+        self.cut_mode = "LINE"
         self.extend_line = False
+        self.grid_subdivisions = 2
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
         self._pixel_raw_end = self._pixel_end
@@ -849,6 +1574,10 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._start_snap_uv = None
         self._snap_tree = None
         self._snap_points = None
+        self._grid_segments_pixel = ()
+        self._grid_preview_size = 0.0
+        self._grid_preview_angle = 0.0
+        self._grid_step_active = False
         self._cursor_is_modal = False
         self._stage = 0
         self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
@@ -878,11 +1607,19 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
         if event.type == "MOUSEMOVE":
             self._pixel_raw_end = (event.mouse_region_x, event.mouse_region_y)
-            self._pixel_end = self._update_pointer(
-                context,
-                self._pixel_raw_end,
-                nearest_axis=event.ctrl,
-            )
+            if self.cut_mode == "GRID" and self._stage == 1:
+                self._update_grid_preview(
+                    context,
+                    self._pixel_raw_end,
+                    snap_angle=event.ctrl,
+                    step_size=event.alt,
+                )
+            else:
+                self._pixel_end = self._update_pointer(
+                    context,
+                    self._pixel_raw_end,
+                    nearest_axis=event.ctrl,
+                )
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
 
@@ -890,22 +1627,79 @@ class UV_OT_batch_knife(bpy.types.Operator):
             self._point_snap_enabled = not self._point_snap_enabled
             if self._point_snap_enabled and self._snap_tree is None:
                 self._build_point_snap_cache(context)
-            self._pixel_end = self._update_pointer(
-                context,
-                self._pixel_raw_end,
-                nearest_axis=False,
-            )
-            self._set_status_text(context)
-            context.area.tag_redraw()
-            return {"RUNNING_MODAL"}
-
-        if event.type == "C" and event.value == "PRESS":
-            self.extend_line = not self.extend_line
+            if self.cut_mode == "GRID" and self._stage == 1:
+                self._update_grid_preview(
+                    context,
+                    self._pixel_raw_end,
+                    snap_angle=event.ctrl,
+                    step_size=event.alt,
+                )
+            else:
+                self._pixel_end = self._update_pointer(
+                    context,
+                    self._pixel_raw_end,
+                    nearest_axis=False,
+                )
             self._set_status_text(context)
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
 
         if (
+            self.cut_mode == "LINE"
+            and event.type == "C"
+            and event.value == "PRESS"
+        ):
+            self.extend_line = not self.extend_line
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "G" and event.value == "PRESS":
+            self.cut_mode = "GRID" if self.cut_mode == "LINE" else "LINE"
+            self._axis_lock = None
+            self._active_axis = None
+            self._grid_segments_pixel = ()
+            if self._stage == 1:
+                if self.cut_mode == "GRID":
+                    self._update_grid_preview(
+                        context,
+                        self._pixel_raw_end,
+                        snap_angle=event.ctrl,
+                        step_size=event.alt,
+                    )
+                else:
+                    self._pixel_end = self._update_pointer(
+                        context,
+                        self._pixel_raw_end,
+                        nearest_axis=False,
+                    )
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if (
+            self.cut_mode == "GRID"
+            and self._stage == 1
+            and event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}
+        ):
+            increment = 1 if event.type == "WHEELUPMOUSE" else -1
+            self.grid_subdivisions = min(
+                64,
+                max(1, self.grid_subdivisions + increment),
+            )
+            self._update_grid_preview(
+                context,
+                self._pixel_raw_end,
+                snap_angle=event.ctrl,
+                step_size=event.alt,
+            )
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if (
+            self.cut_mode == "LINE"
+            and
             self._stage == 1
             and event.type in {"X", "Y"}
             and event.value == "PRESS"
@@ -935,10 +1729,35 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 self._pixel_end = point
                 self._start_snap_uv = self._current_snap_uv
                 self._stage = 1
+                if self.cut_mode == "GRID":
+                    self._grid_preview_size = 0.0
+                    self._grid_segments_pixel = ()
                 context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
 
             self._pixel_raw_end = raw_point
+            if self.cut_mode == "GRID":
+                self._update_grid_preview(
+                    context,
+                    raw_point,
+                    snap_angle=event.ctrl,
+                    step_size=event.alt,
+                )
+                if self._grid_preview_size <= _UV_EPS:
+                    return {"RUNNING_MODAL"}
+                center_uv = (
+                    self._start_snap_uv
+                    if self._start_snap_uv is not None
+                    else context.region.view2d.region_to_view(
+                        *self._pixel_start
+                    )
+                )
+                self.grid_center_uv = center_uv
+                self.grid_size = self._grid_preview_size
+                self.grid_angle = self._grid_preview_angle
+                self._finish_modal(context)
+                return self.execute(context)
+
             self._pixel_end = self._update_pointer(
                 context,
                 raw_point,
@@ -969,30 +1788,60 @@ class UV_OT_batch_knife(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
-        origin = (float(self.start_uv[0]), float(self.start_uv[1]))
-        end = (float(self.end_uv[0]), float(self.end_uv[1]))
-        direction = _sub2(end, origin)
-        if direction[0] * direction[0] + direction[1] * direction[1] <= _UV_EPS:
-            self.report({"WARNING"}, "Линия UV Batch Knife слишком короткая")
-            return {"CANCELLED"}
-
         started = time.perf_counter()
         sync_selection = context.scene.tool_settings.use_uv_select_sync
         results = []
-        for obj in _edit_mesh_objects(context):
-            results.append(
-                _cut_object(
-                    obj,
-                    origin,
-                    direction,
-                    target_mode=self.target_mode,
-                    extend_line=self.extend_line,
-                    split_uv_islands=self.split_uv_islands,
-                    separation=self.separation,
-                    mark_seams=self.mark_seams,
-                    sync_selection=sync_selection,
-                )
+        if self.cut_mode == "GRID":
+            center = (
+                float(self.grid_center_uv[0]),
+                float(self.grid_center_uv[1]),
             )
+            if self.grid_size <= _UV_EPS:
+                self.report({"WARNING"}, "UV Grid Knife слишком маленький")
+                return {"CANCELLED"}
+            for obj in _edit_mesh_objects(context):
+                results.append(
+                    _cut_grid_object(
+                        obj,
+                        center,
+                        self.grid_size,
+                        self.grid_angle,
+                        self.grid_subdivisions,
+                        target_mode=self.target_mode,
+                        split_uv_islands=self.split_uv_islands,
+                        separation=self.separation,
+                        mark_seams=self.mark_seams,
+                        sync_selection=sync_selection,
+                    )
+                )
+        else:
+            origin = (float(self.start_uv[0]), float(self.start_uv[1]))
+            end = (float(self.end_uv[0]), float(self.end_uv[1]))
+            direction = _sub2(end, origin)
+            if (
+                direction[0] * direction[0]
+                + direction[1] * direction[1]
+                <= _UV_EPS
+            ):
+                self.report(
+                    {"WARNING"},
+                    "Линия UV Batch Knife слишком короткая",
+                )
+                return {"CANCELLED"}
+            for obj in _edit_mesh_objects(context):
+                results.append(
+                    _cut_object(
+                        obj,
+                        origin,
+                        direction,
+                        target_mode=self.target_mode,
+                        extend_line=self.extend_line,
+                        split_uv_islands=self.split_uv_islands,
+                        separation=self.separation,
+                        mark_seams=self.mark_seams,
+                        sync_selection=sync_selection,
+                    )
+                )
 
         cut_edges = sum(item["cut_edges"] for item in results)
         cut_faces = sum(item["cut_faces"] for item in results)
@@ -1001,19 +1850,29 @@ class UV_OT_batch_knife(bpy.types.Operator):
         elapsed = time.perf_counter() - started
 
         if cut_edges == 0:
+            tool_name = (
+                "UV Grid Knife"
+                if self.cut_mode == "GRID"
+                else "Линия"
+            )
             self.report(
                 {"WARNING"},
                 (
-                    f"Линия не пересекла подходящие UV-грани "
+                    f"{tool_name} не пересёк подходящие UV-грани "
                     f"(проверено: {target_faces})"
                 ),
             )
             return {"CANCELLED"}
 
+        tool_name = (
+            "UV Grid Knife"
+            if self.cut_mode == "GRID"
+            else "UV Batch Knife"
+        )
         self.report(
             {"INFO"},
             (
-                f"UV Batch Knife: рёбер {cut_edges}, вершин {new_vertices}, "
+                f"{tool_name}: рёбер {cut_edges}, вершин {new_vertices}, "
                 f"затронуто граней {cut_faces}; {elapsed:.2f} с"
             ),
         )
