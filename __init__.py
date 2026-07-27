@@ -534,7 +534,10 @@ def _extended_preview_points(start, end):
 
 def _draw_batch_knife(operator):
     context = bpy.context
-    if context.area is not operator._area:
+    if (
+        context.area is None
+        or context.area.as_pointer() != operator._area_pointer
+    ):
         return
 
     start = operator._pixel_start
@@ -643,6 +646,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
     _draw_handle = None
     _area = None
+    _area_pointer = 0
     _pixel_start = None
     _pixel_end = None
     _stage = 0
@@ -685,6 +689,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
     def invoke(self, context, event):
         self._area = context.area
+        self._area_pointer = context.area.as_pointer()
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
         self._stage = 0
@@ -702,7 +707,10 @@ class UV_OT_batch_knife(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
-        if context.area is not self._area:
+        if (
+            context.area is None
+            or context.area.as_pointer() != self._area_pointer
+        ):
             self._finish_modal(context)
             return {"CANCELLED"}
 
@@ -789,12 +797,37 @@ class UV_OT_batch_knife(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class IMAGE_PT_uv_batch_knife(bpy.types.Panel):
+    bl_label = "UV Batch Knife"
+    bl_idname = "IMAGE_PT_uv_batch_knife"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "UV"
+
+    @classmethod
+    def poll(cls, context):
+        area = context.area
+        return (
+            area is not None
+            and area.ui_type == "UV"
+            and context.mode == "EDIT_MESH"
+        )
+
+    def draw(self, context):
+        column = self.layout.column(align=True)
+        column.operator(UV_OT_batch_knife.bl_idname, text="Start UV Batch Knife")
+        column.label(text="Shortcut: K")
+
+
 def _menu_uv_batch_knife(self, context):
     self.layout.separator()
-    self.layout.operator(UV_OT_batch_knife.bl_idname, icon="MOD_TRIANGULATE")
+    self.layout.operator(UV_OT_batch_knife.bl_idname)
 
 
-_classes = (UV_OT_batch_knife,)
+_classes = (
+    UV_OT_batch_knife,
+    IMAGE_PT_uv_batch_knife,
+)
 _keymaps = []
 
 
