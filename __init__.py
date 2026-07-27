@@ -562,7 +562,12 @@ def _draw_batch_knife(operator):
         {"pos": (line_start, line_end)},
     )
     shader.bind()
-    shader.uniform_float("color", (1.0, 0.25, 0.05, 0.95))
+    line_color = (
+        (0.1, 0.65, 1.0, 1.0)
+        if operator._snap_active
+        else (1.0, 0.25, 0.05, 0.95)
+    )
+    shader.uniform_float("color", line_color)
     line_batch.draw(shader)
 
     gpu.state.point_size_set(7.0)
@@ -649,6 +654,9 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _area_pointer = 0
     _pixel_start = None
     _pixel_end = None
+    _pixel_raw_end = None
+    _axis_lock = None
+    _snap_active = False
     _stage = 0
 
     @classmethod
@@ -687,11 +695,44 @@ class UV_OT_batch_knife(bpy.types.Operator):
         if context.workspace is not None:
             context.workspace.status_text_set(None)
 
+    def _constrained_point(self, point, nearest_axis=False):
+        if self._pixel_start is None:
+            self._snap_active = False
+            return point
+
+        axis = self._axis_lock
+        if axis is None and nearest_axis:
+            delta_x = point[0] - self._pixel_start[0]
+            delta_y = point[1] - self._pixel_start[1]
+            axis = "X" if abs(delta_x) >= abs(delta_y) else "Y"
+
+        self._snap_active = axis is not None
+        if axis == "X":
+            return point[0], self._pixel_start[1]
+        if axis == "Y":
+            return self._pixel_start[0], point[1]
+        return point
+
+    def _set_status_text(self, context):
+        lock_text = ""
+        if self._axis_lock == "X":
+            lock_text = " | X: горизонталь зафиксирована"
+        elif self._axis_lock == "Y":
+            lock_text = " | Y: вертикаль зафиксирована"
+        context.workspace.status_text_set(
+            "UV Batch Knife: ЛКМ — точки; Ctrl — ближайшая ось; "
+            "X/Y — фиксация оси; ПКМ/Esc — отмена"
+            + lock_text
+        )
+
     def invoke(self, context, event):
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
+        self._pixel_raw_end = self._pixel_end
+        self._axis_lock = None
+        self._snap_active = False
         self._stage = 0
         self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
             _draw_batch_knife,
@@ -700,9 +741,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
             "POST_PIXEL",
         )
         context.window_manager.modal_handler_add(self)
-        context.workspace.status_text_set(
-            "UV Batch Knife: ЛКМ — первая и вторая точки; ПКМ/Esc — отмена"
-        )
+        self._set_status_text(context)
         context.area.tag_redraw()
         return {"RUNNING_MODAL"}
 
@@ -719,7 +758,27 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return {"CANCELLED"}
 
         if event.type == "MOUSEMOVE":
-            self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
+            self._pixel_raw_end = (event.mouse_region_x, event.mouse_region_y)
+            self._pixel_end = self._constrained_point(
+                self._pixel_raw_end,
+                nearest_axis=event.ctrl,
+            )
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if (
+            self._stage == 1
+            and event.type in {"X", "Y"}
+            and event.value == "PRESS"
+        ):
+            self._axis_lock = (
+                None if self._axis_lock == event.type else event.type
+            )
+            self._pixel_end = self._constrained_point(
+                self._pixel_raw_end,
+                nearest_axis=False,
+            )
+            self._set_status_text(context)
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
 
@@ -728,14 +787,19 @@ class UV_OT_batch_knife(bpy.types.Operator):
             if self._stage == 0:
                 self._pixel_start = point
                 self._pixel_end = point
+                self._pixel_raw_end = point
                 self._stage = 1
                 context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
 
-            if _dist_sq(point, self._pixel_start) < 16.0:
+            self._pixel_raw_end = point
+            self._pixel_end = self._constrained_point(
+                point,
+                nearest_axis=event.ctrl,
+            )
+            if _dist_sq(self._pixel_end, self._pixel_start) < 16.0:
                 return {"RUNNING_MODAL"}
 
-            self._pixel_end = point
             start_uv = context.region.view2d.region_to_view(*self._pixel_start)
             end_uv = context.region.view2d.region_to_view(*self._pixel_end)
             self.start_uv = start_uv
