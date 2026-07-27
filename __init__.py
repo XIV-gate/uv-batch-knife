@@ -657,6 +657,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _pixel_raw_end = None
     _axis_lock = None
     _snap_active = False
+    _cursor_is_modal = False
     _stage = 0
 
     @classmethod
@@ -690,6 +691,9 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 "WINDOW",
             )
             self._draw_handle = None
+        if self._cursor_is_modal and context.window is not None:
+            context.window.cursor_modal_restore()
+            self._cursor_is_modal = False
         if context.area is not None:
             context.area.tag_redraw()
         if context.workspace is not None:
@@ -733,6 +737,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._pixel_raw_end = self._pixel_end
         self._axis_lock = None
         self._snap_active = False
+        self._cursor_is_modal = False
         self._stage = 0
         self._draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
             _draw_batch_knife,
@@ -740,6 +745,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
             "WINDOW",
             "POST_PIXEL",
         )
+        context.window.cursor_modal_set("KNIFE")
+        self._cursor_is_modal = True
         context.window_manager.modal_handler_add(self)
         self._set_status_text(context)
         context.area.tag_redraw()
