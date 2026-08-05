@@ -1,0 +1,3 @@
+⚠️ DANGEROUS COMMIT — DO NOT BUILD OR INSTALL
+
+This commit contains the UV Batch Knife 1.5.2 updater. It still launches Blender with `--factory-startup` and `extension install-file` against the live user profile and can overwrite `5.2/config/userpref.blend`, destroying Blender preferences, keymaps, and add-on settings. The release, asset, and tag were removed. Use commit 09e709a (v1.5.3) or newer, installed manually.
