@@ -34,10 +34,6 @@ latest_payload = {
     "assets": [
         {
             "name": "uv_batch_knife-1.6.0.zip",
-            "url": (
-                "https://api.github.com/repos/XIV-gate/uv-batch-knife/"
-                "releases/assets/123456"
-            ),
             "browser_download_url": (
                 "https://github.com/XIV-gate/uv-batch-knife/releases/"
                 "download/v1.6.0/uv_batch_knife-1.6.0.zip"
@@ -49,13 +45,7 @@ update = addon._release_update_info(latest_payload)
 assert update["is_newer"]
 assert update["latest_version"] == "1.6.0"
 assert update["asset_name"] == "uv_batch_knife-1.6.0.zip"
-authenticated_update = addon._release_update_info(
-    latest_payload,
-    authenticated=True,
-)
-assert authenticated_update["asset_url"].startswith(
-    "https://api.github.com/"
-)
+assert update["asset_url"].startswith("https://github.com/")
 
 current_payload = {
     "tag_name": "v1.5.0",
@@ -87,6 +77,23 @@ license = ["SPDX:GPL-3.0-or-later"]
     manifest = addon._validate_update_archive(archive_path, "1.6.0")
     assert manifest["id"] == "uv_batch_knife"
     assert manifest["version"] == "1.6.0"
+    install_command = addon._update_install_command(
+        archive_path,
+        "user_default",
+    )
+    assert install_command[0] == bpy.app.binary_path
+    assert install_command[1:5] == [
+        "--background",
+        "--factory-startup",
+        "--command",
+        "extension",
+    ]
+    assert install_command[-4:] == [
+        "-r",
+        "user_default",
+        "-e",
+        str(archive_path.resolve()),
+    ]
 
 
 manifest = tomllib.loads((ROOT / "blender_manifest.toml").read_text("utf-8"))

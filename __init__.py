@@ -1,6 +1,7 @@
 import math
 import json
 import pathlib
+import subprocess
 import tempfile
 import time
 import tomllib
@@ -46,7 +47,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.0"
+_ADDON_VERSION = "1.5.1"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -71,36 +72,6 @@ _ENDPOINT_EXTENSION_ITEMS = (
 
 class _UpdateError(RuntimeError):
     pass
-
-
-class _UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        request,
-        file_pointer,
-        code,
-        message,
-        headers,
-        new_url,
-    ):
-        redirected = super().redirect_request(
-            request,
-            file_pointer,
-            code,
-            message,
-            headers,
-            new_url,
-        )
-        if redirected is None:
-            return None
-        old_host = urllib.parse.urlparse(request.full_url).hostname
-        new_host = urllib.parse.urlparse(new_url).hostname
-        if old_host != new_host:
-            redirected.remove_header("Authorization")
-        return redirected
-
-
-_UPDATE_URL_OPENER = urllib.request.build_opener(_UpdateRedirectHandler())
 
 
 def _semantic_version(value):
@@ -133,36 +104,24 @@ def _trusted_update_url(url, *, api=False):
     )
 
 
-def _read_latest_release_metadata(github_token=""):
+def _read_latest_release_metadata():
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": _UPDATE_USER_AGENT,
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
     request = urllib.request.Request(
         _GITHUB_LATEST_RELEASE_API,
         headers=headers,
     )
     try:
-        with _UPDATE_URL_OPENER.open(request, timeout=20.0) as response:
+        with urllib.request.urlopen(request, timeout=20.0) as response:
             if not _trusted_update_url(response.geturl(), api=True):
                 raise _UpdateError("GitHub API redirected to an untrusted host")
             payload_bytes = response.read(_MAX_UPDATE_METADATA_BYTES + 1)
     except urllib.error.HTTPError as error:
-        if error.code == 401:
-            raise _UpdateError("GitHub rejected the access token") from error
         if error.code == 404:
-            if github_token:
-                message = (
-                    "Private repository is not accessible with this token"
-                )
-            else:
-                message = (
-                    "Repository is private; enter a read-only GitHub token"
-                )
-            raise _UpdateError(message) from error
+            raise _UpdateError("GitHub has no published release") from error
         if error.code == 403:
             raise _UpdateError(
                 "GitHub rate limit reached; try again later"
@@ -187,8 +146,6 @@ def _read_latest_release_metadata(github_token=""):
 def _release_update_info(
     payload,
     current_version=_ADDON_VERSION,
-    *,
-    authenticated=False,
 ):
     tag_name = payload.get("tag_name")
     latest_version = _normalized_version(tag_name)
@@ -222,31 +179,26 @@ def _release_update_info(
         raise _UpdateError(
             f"Latest release does not contain {expected_name}"
         )
-    asset_url = asset.get("url" if authenticated else "browser_download_url")
-    if not isinstance(asset_url, str) or not _trusted_update_url(
-        asset_url,
-        api=authenticated,
-    ):
+    asset_url = asset.get("browser_download_url")
+    if not isinstance(asset_url, str) or not _trusted_update_url(asset_url):
         raise _UpdateError("Latest release contains an untrusted download URL")
     info["asset_name"] = expected_name
     info["asset_url"] = asset_url
     return info
 
 
-def _download_update_archive(asset_url, asset_name, github_token=""):
+def _download_update_archive(asset_url, asset_name):
     headers = {
         "Accept": "application/octet-stream",
         "User-Agent": _UPDATE_USER_AGENT,
     }
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
     request = urllib.request.Request(
         asset_url,
         headers=headers,
     )
     archive_path = None
     try:
-        with _UPDATE_URL_OPENER.open(request, timeout=30.0) as response:
+        with urllib.request.urlopen(request, timeout=30.0) as response:
             if not _trusted_update_url(response.geturl()):
                 raise _UpdateError("Update download redirected to an untrusted host")
             content_length = response.headers.get("Content-Length")
@@ -336,10 +288,47 @@ def _current_extension_repository():
     return "user_default"
 
 
-def _addon_preferences(context):
-    module_name = __package__ or __name__
-    addon = context.preferences.addons.get(module_name)
-    return addon.preferences if addon is not None else None
+def _update_install_command(archive_path, repository):
+    return [
+        bpy.app.binary_path,
+        "--background",
+        "--factory-startup",
+        "--command",
+        "extension",
+        "install-file",
+        "-r",
+        repository,
+        "-e",
+        str(pathlib.Path(archive_path).resolve()),
+    ]
+
+
+def _install_update_archive(archive_path, repository):
+    command = _update_install_command(archive_path, repository)
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120.0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise _UpdateError(
+            f"Cannot start Blender extension installer: {error}"
+        ) from error
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout).strip()
+        if details:
+            details = details.splitlines()[-1]
+            raise _UpdateError(f"Blender installer failed: {details}")
+        raise _UpdateError("Blender extension installer failed")
+    if "STATUS Reinstalled" not in completed.stdout and (
+        "STATUS Installed" not in completed.stdout
+    ):
+        raise _UpdateError("Blender did not confirm extension installation")
+    return completed.stdout
 
 
 def _cross2(a, b):
@@ -2585,26 +2574,6 @@ def _draw_batch_knife(operator):
     gpu.state.blend_set("NONE")
 
 
-class UVBatchKnifePreferences(bpy.types.AddonPreferences):
-    bl_idname = __package__ or __name__
-
-    github_token: StringProperty(
-        name="GitHub Token",
-        description=(
-            "Optional read-only token required only while the GitHub "
-            "repository is private"
-        ),
-        subtype="PASSWORD",
-        default="",
-    )
-
-    def draw(self, context):
-        del context
-        layout = self.layout
-        layout.prop(self, "github_token")
-        layout.label(text="Required only for a private GitHub repository")
-
-
 class UV_OT_batch_knife_update(bpy.types.Operator):
     bl_idname = "uv.batch_knife_update"
     bl_label = "Check and Install Update"
@@ -2631,17 +2600,8 @@ class UV_OT_batch_knife_update(bpy.types.Operator):
         self._set_status(context, "Checking GitHub Releases…")
         archive_path = None
         try:
-            preferences = _addon_preferences(context)
-            github_token = (
-                preferences.github_token.strip()
-                if preferences is not None
-                else ""
-            )
-            payload = _read_latest_release_metadata(github_token)
-            update = _release_update_info(
-                payload,
-                authenticated=bool(github_token),
-            )
+            payload = _read_latest_release_metadata()
+            update = _release_update_info(payload)
             if not update["is_newer"]:
                 message = (
                     f"Version {_ADDON_VERSION} is already the latest"
@@ -2657,37 +2617,26 @@ class UV_OT_batch_knife_update(bpy.types.Operator):
             archive_path = _download_update_archive(
                 update["asset_url"],
                 update["asset_name"],
-                github_token,
             )
             _validate_update_archive(
                 archive_path,
                 update["latest_version"],
             )
 
-            install_result = bpy.ops.extensions.package_install_files(
-                "EXEC_DEFAULT",
-                filepath=str(archive_path),
-                repo=_current_extension_repository(),
-                enable_on_install=True,
-                overwrite=True,
+            _install_update_archive(
+                archive_path,
+                _current_extension_repository(),
             )
-            if "FINISHED" not in install_result:
-                raise _UpdateError("Blender could not install the update")
 
             message = (
-                f"Updated to {update['latest_version']}; restart Blender "
-                "if the interface still shows the old version"
+                f"Installed {update['latest_version']}; restart Blender "
+                "to load the update"
             )
             self._set_status(context, message)
             self.report({"INFO"}, message)
             return {"FINISHED"}
         except _UpdateError as error:
             message = str(error)
-            self._set_status(context, message)
-            self.report({"ERROR"}, message)
-            return {"CANCELLED"}
-        except RuntimeError as error:
-            message = f"Blender update installation failed: {error}"
             self._set_status(context, message)
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
@@ -3771,13 +3720,6 @@ class IMAGE_PT_uv_batch_knife(bpy.types.Panel):
         column.label(text="Shortcut: K")
         column.separator()
         column.label(text=f"Installed Version: {_ADDON_VERSION}")
-        preferences = _addon_preferences(context)
-        if preferences is not None:
-            column.prop(
-                preferences,
-                "github_token",
-                text="GitHub Token",
-            )
         column.operator(
             UV_OT_batch_knife_update.bl_idname,
             text="Check and Install Update",
@@ -3811,7 +3753,6 @@ def _menu_uv_batch_knife(self, context):
 
 
 _classes = (
-    UVBatchKnifePreferences,
     UV_OT_batch_knife_update,
     UV_OT_batch_knife,
     IMAGE_PT_uv_batch_knife,
