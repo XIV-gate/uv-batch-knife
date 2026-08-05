@@ -1,12 +1,15 @@
 import math
+import importlib
 import json
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 import textwrap
 import time
 import tomllib
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,7 +52,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.4"
+_ADDON_VERSION = "1.5.5"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -58,6 +61,11 @@ _GITHUB_LATEST_RELEASE_API = (
 _UPDATE_USER_AGENT = f"UV-Batch-Knife/{_ADDON_VERSION} Blender-Updater"
 _MAX_UPDATE_METADATA_BYTES = 2 * 1024 * 1024
 _MAX_UPDATE_ARCHIVE_BYTES = 64 * 1024 * 1024
+_UPDATE_PACKAGE_FILES = (
+    "__init__.py",
+    "README.md",
+    "blender_manifest.toml",
+)
 _ENDPOINT_EXTENSION_ITEMS = (
     (
         "NEAREST_CORNER",
@@ -268,6 +276,7 @@ def _validate_update_archive(archive_path, expected_version):
             if init_path not in {entry.filename for entry in entries}:
                 raise _UpdateError("Update archive does not contain __init__.py")
             manifest_bytes = archive.read(manifest_entry)
+            init_bytes = archive.read(init_path)
     except (OSError, zipfile.BadZipFile) as error:
         raise _UpdateError("Downloaded update is not a valid ZIP archive") from error
 
@@ -280,6 +289,10 @@ def _validate_update_archive(archive_path, expected_version):
     manifest_version = _normalized_version(manifest.get("version"))
     if manifest_version != _normalized_version(expected_version):
         raise _UpdateError("Downloaded package version does not match the release")
+    try:
+        compile(init_bytes, "<uv_batch_knife_update>", "exec")
+    except (SyntaxError, ValueError) as error:
+        raise _UpdateError("Update contains invalid Python code") from error
     return manifest
 
 
@@ -291,11 +304,7 @@ def _install_update_archive(
     root = pathlib.Path(extension_root or __file__).resolve()
     if extension_root is None:
         root = root.parent
-    package_files = (
-        "__init__.py",
-        "README.md",
-        "blender_manifest.toml",
-    )
+    package_files = _UPDATE_PACKAGE_FILES
     try:
         with zipfile.ZipFile(archive_path) as archive:
             archive_names = {
@@ -342,6 +351,161 @@ def _install_update_archive(
     except (OSError, zipfile.BadZipFile) as error:
         raise _UpdateError(f"Cannot install update package: {error}") from error
     return package_files
+
+
+def _extension_root(extension_root=None):
+    if extension_root is not None:
+        return pathlib.Path(extension_root).resolve()
+    return pathlib.Path(__file__).resolve().parent
+
+
+def _capture_extension_snapshot(extension_root=None):
+    root = _extension_root(extension_root)
+    try:
+        return {
+            name: (root / name).read_bytes()
+            for name in _UPDATE_PACKAGE_FILES
+        }
+    except OSError as error:
+        raise _UpdateError(
+            f"Cannot back up the installed extension: {error}"
+        ) from error
+
+
+def _restore_extension_snapshot(snapshot, extension_root=None):
+    root = _extension_root(extension_root)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f".{_ADDON_ID}_rollback_",
+            dir=root.parent,
+        ) as temporary_directory:
+            staged_root = pathlib.Path(temporary_directory)
+            for name in _UPDATE_PACKAGE_FILES:
+                data = snapshot.get(name)
+                if not isinstance(data, bytes):
+                    raise _UpdateError(
+                        f"Update rollback is missing {name}"
+                    )
+                staged_path = staged_root / name
+                staged_path.write_bytes(data)
+            for name in _UPDATE_PACKAGE_FILES:
+                os.replace(staged_root / name, root / name)
+    except OSError as error:
+        raise _UpdateError(
+            f"Cannot restore the previous extension version: {error}"
+        ) from error
+
+
+def _remove_module_bytecode(module, extension_root=None):
+    cached_path = getattr(module, "__cached__", None)
+    if cached_path:
+        pathlib.Path(cached_path).unlink(missing_ok=True)
+    root = _extension_root(extension_root)
+    cache_root = root / "__pycache__"
+    if cache_root.is_dir():
+        for candidate in cache_root.glob("__init__*.pyc"):
+            candidate.unlink(missing_ok=True)
+
+
+def _set_reloaded_update_status(message):
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is not None and hasattr(
+        window_manager,
+        "uv_batch_knife_update_status",
+    ):
+        window_manager.uv_batch_knife_update_status = message
+        for window in window_manager.windows:
+            if window.screen is None:
+                continue
+            for area in window.screen.areas:
+                area.tag_redraw()
+    print(f"UV Batch Knife: {message}")
+
+
+def _make_extension_reload_callback(
+    module_name,
+    expected_version,
+    snapshot,
+    extension_root=None,
+):
+    root = _extension_root(extension_root)
+    old_version = _ADDON_VERSION
+    reload_module = importlib.reload
+    invalidate_caches = importlib.invalidate_caches
+    restore_snapshot = _restore_extension_snapshot
+    remove_bytecode = _remove_module_bytecode
+    format_traceback = traceback.format_exc
+
+    def reload_when_idle():
+        module = sys.modules.get(module_name)
+        if module is None:
+            _set_reloaded_update_status(
+                f"Installed {expected_version}, but the loaded module was not found"
+            )
+            return None
+        if getattr(module, "_active_batch_knife_modals", 0) > 0:
+            return 0.25
+
+        try:
+            module.unregister()
+            remove_bytecode(module, root)
+            invalidate_caches()
+            module = reload_module(module)
+            loaded_version = _normalized_version(module._ADDON_VERSION)
+            if loaded_version != _normalized_version(expected_version):
+                raise _UpdateError(
+                    f"Reloaded {loaded_version}, expected {expected_version}"
+                )
+            module.register()
+            module._set_reloaded_update_status(
+                f"Updated to {expected_version}; loaded in this Blender session"
+            )
+            return None
+        except Exception as reload_error:
+            failure_traceback = format_traceback()
+            try:
+                try:
+                    module.unregister()
+                except Exception:
+                    pass
+                restore_snapshot(snapshot, root)
+                remove_bytecode(module, root)
+                invalidate_caches()
+                module = reload_module(module)
+                module.register()
+                module._set_reloaded_update_status(
+                    f"Could not load {expected_version}; restored {old_version}: "
+                    f"{reload_error}"
+                )
+            except Exception as rollback_error:
+                print(
+                    "UV Batch Knife automatic reload and rollback failed:\n"
+                    f"{failure_traceback}\nRollback error: {rollback_error}"
+                )
+            return None
+
+    return reload_when_idle
+
+
+def _schedule_extension_reload(
+    expected_version,
+    snapshot,
+    extension_root=None,
+):
+    callback = _make_extension_reload_callback(
+        __name__,
+        expected_version,
+        snapshot,
+        extension_root,
+    )
+    try:
+        bpy.app.timers.register(callback, first_interval=0.1)
+    except Exception as error:
+        _restore_extension_snapshot(snapshot, extension_root)
+        raise _UpdateError(
+            f"Cannot schedule automatic reload; update rolled back: {error}"
+        ) from error
+    return callback
 
 
 def _cross2(a, b):
@@ -2647,11 +2811,20 @@ class UV_OT_batch_knife_update(bpy.types.Operator):
                 update["latest_version"],
             )
 
-            _install_update_archive(archive_path)
+            extension_root = _extension_root()
+            snapshot = _capture_extension_snapshot(extension_root)
+            _install_update_archive(
+                archive_path,
+                extension_root=extension_root,
+            )
+            _schedule_extension_reload(
+                update["latest_version"],
+                snapshot,
+                extension_root,
+            )
 
             message = (
-                f"Installed {update['latest_version']}; restart Blender "
-                "to load the update"
+                f"Installed {update['latest_version']}; loading it now…"
             )
             self._set_status(context, message)
             self.report({"INFO"}, message)
@@ -2817,6 +2990,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _grid_preview_angle = 0.0
     _grid_step_active = False
     _cursor_is_modal = False
+    _reload_modal_tracked = False
     _stage = 0
 
     @classmethod
@@ -2853,6 +3027,13 @@ class UV_OT_batch_knife(bpy.types.Operator):
         layout.prop(self, "mark_seams")
 
     def _finish_modal(self, context):
+        global _active_batch_knife_modals
+        if self._reload_modal_tracked:
+            _active_batch_knife_modals = max(
+                0,
+                _active_batch_knife_modals - 1,
+            )
+            self._reload_modal_tracked = False
         if self._draw_handle is not None:
             bpy.types.SpaceImageEditor.draw_handler_remove(
                 self._draw_handle,
@@ -3250,6 +3431,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
         )
 
     def invoke(self, context, event):
+        global _active_batch_knife_modals
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
         self.cut_mode = "LINE"
@@ -3292,6 +3474,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
         context.window.cursor_modal_set("KNIFE")
         self._cursor_is_modal = True
         context.window_manager.modal_handler_add(self)
+        _active_batch_knife_modals += 1
+        self._reload_modal_tracked = True
         self._set_status_text(context)
         context.area.tag_redraw()
         return {"RUNNING_MODAL"}
@@ -3780,6 +3964,7 @@ _classes = (
     IMAGE_PT_uv_batch_knife,
 )
 _keymaps = []
+_active_batch_knife_modals = 0
 
 
 def register():
