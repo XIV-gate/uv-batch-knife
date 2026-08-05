@@ -14,6 +14,8 @@ from bpy.props import (
     IntProperty,
 )
 from gpu_extras.batch import batch_for_shader
+from mathutils import Vector
+from mathutils.geometry import tessellate_polygon
 from mathutils.kdtree import KDTree
 
 
@@ -34,6 +36,7 @@ _SNAP_MODE_LABELS = {
     "EDGE_CENTERS": "S3 Edge Centers",
     "FACE_CENTERS": "S4 Face Centers",
 }
+_LINE_MODES = ("FINITE", "INFINITE", "MULTI")
 
 
 def _cross2(a, b):
@@ -746,6 +749,755 @@ def _cut_face_set_with_line(
     }
 
 
+def _project_point_to_segment(point, edge_a, edge_b):
+    edge = _sub2(edge_b, edge_a)
+    length_sq = edge[0] * edge[0] + edge[1] * edge[1]
+    if length_sq <= _UV_EPS * _UV_EPS:
+        return edge_a, 0.0, _dist_sq(point, edge_a)
+    relative = _sub2(point, edge_a)
+    factor = (
+        relative[0] * edge[0] + relative[1] * edge[1]
+    ) / length_sq
+    factor = min(1.0, max(0.0, factor))
+    projected = (
+        edge_a[0] + edge[0] * factor,
+        edge_a[1] + edge[1] * factor,
+    )
+    return projected, factor, _dist_sq(point, projected)
+
+
+def _face_boundary_descriptor(
+    face,
+    uv_layer,
+    point,
+    *,
+    nearest=False,
+):
+    best = None
+    for loop in face.loops:
+        next_loop = loop.link_loop_next
+        uv_a = (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
+        uv_b = (
+            next_loop[uv_layer].uv.x,
+            next_loop[uv_layer].uv.y,
+        )
+        projected, factor, distance_sq = _project_point_to_segment(
+            point,
+            uv_a,
+            uv_b,
+        )
+        if best is None or distance_sq < best[0]:
+            best = (distance_sq, loop, factor, projected)
+
+    if best is None:
+        return None
+    tolerance = max(_UV_EPS * 10.0, 1.0e-6)
+    if not nearest and best[0] > tolerance * tolerance:
+        return None
+
+    _distance_sq, loop, factor, projected = best
+    next_loop = loop.link_loop_next
+    descriptor = {
+        "point": projected,
+        "edge": None,
+        "edge_factor": None,
+        "vert": None,
+        "loop": loop,
+    }
+    if factor <= _UV_EPS:
+        descriptor["vert"] = loop.vert
+    elif factor >= 1.0 - _UV_EPS:
+        descriptor["vert"] = next_loop.vert
+    else:
+        edge = loop.edge
+        descriptor["edge"] = edge
+        descriptor["edge_factor"] = (
+            factor
+            if loop.vert is edge.verts[0]
+            else 1.0 - factor
+        )
+    return descriptor
+
+
+def _point_on_polygon_boundary(point, polygon):
+    tolerance_sq = max(_UV_EPS * 10.0, 1.0e-6) ** 2
+    for index, edge_a in enumerate(polygon):
+        edge_b = polygon[(index + 1) % len(polygon)]
+        _projected, _factor, distance_sq = _project_point_to_segment(
+            point,
+            edge_a,
+            edge_b,
+        )
+        if distance_sq <= tolerance_sq:
+            return True
+    return False
+
+
+def _segment_inside_polygon_intervals(start, end, polygon):
+    direction = _sub2(end, start)
+    if _dist_sq(start, end) <= _UV_EPS * _UV_EPS:
+        return []
+
+    factors = [0.0, 1.0]
+    for index, edge_a in enumerate(polygon):
+        edge_b = polygon[(index + 1) % len(polygon)]
+        intersection = _line_edge_intersection(
+            start,
+            direction,
+            edge_a,
+            edge_b,
+            False,
+        )
+        if intersection is not None:
+            factors.append(intersection[0])
+
+    factors.sort()
+    unique_factors = []
+    for factor in factors:
+        if (
+            not unique_factors
+            or abs(factor - unique_factors[-1]) > _FACTOR_EPS
+        ):
+            unique_factors.append(factor)
+
+    intervals = []
+    for factor_a, factor_b in zip(
+        unique_factors,
+        unique_factors[1:],
+    ):
+        if factor_b - factor_a <= _FACTOR_EPS:
+            continue
+        midpoint_factor = (factor_a + factor_b) * 0.5
+        midpoint = (
+            start[0] + direction[0] * midpoint_factor,
+            start[1] + direction[1] * midpoint_factor,
+        )
+        if not _point_in_polygon(midpoint, polygon):
+            continue
+        if _point_on_polygon_boundary(midpoint, polygon):
+            continue
+        intervals.append(
+            (
+                (
+                    start[0] + direction[0] * factor_a,
+                    start[1] + direction[1] * factor_a,
+                ),
+                (
+                    start[0] + direction[0] * factor_b,
+                    start[1] + direction[1] * factor_b,
+                ),
+            )
+        )
+    return intervals
+
+
+def _deduplicate_polyline(points):
+    result = []
+    tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
+    for point in points:
+        normalized = (float(point[0]), float(point[1]))
+        if result and _dist_sq(normalized, result[-1]) <= tolerance_sq:
+            continue
+        result.append(normalized)
+    return result
+
+
+def _polyline_face_point_chains(face, uv_layer, points):
+    polygon = [
+        (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
+        for loop in face.loops
+    ]
+    working = _deduplicate_polyline(points)
+    if len(working) < 2 or len(polygon) < 3:
+        return []
+
+    start_boundary = _face_boundary_descriptor(
+        face,
+        uv_layer,
+        working[0],
+    )
+    if _point_in_polygon(working[0], polygon) and start_boundary is None:
+        nearest = _face_boundary_descriptor(
+            face,
+            uv_layer,
+            working[0],
+            nearest=True,
+        )
+        if nearest is not None:
+            working.insert(0, nearest["point"])
+
+    end_boundary = _face_boundary_descriptor(
+        face,
+        uv_layer,
+        working[-1],
+    )
+    if _point_in_polygon(working[-1], polygon) and end_boundary is None:
+        nearest = _face_boundary_descriptor(
+            face,
+            uv_layer,
+            working[-1],
+            nearest=True,
+        )
+        if nearest is not None:
+            working.append(nearest["point"])
+
+    raw_chains = []
+    current = []
+    tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
+    for segment_start, segment_end in zip(working, working[1:]):
+        intervals = _segment_inside_polygon_intervals(
+            segment_start,
+            segment_end,
+            polygon,
+        )
+        if not intervals:
+            if len(current) >= 2:
+                raw_chains.append(current)
+            current = []
+            continue
+        for interval_start, interval_end in intervals:
+            if (
+                current
+                and _dist_sq(current[-1], interval_start) <= tolerance_sq
+            ):
+                if _dist_sq(current[-1], interval_end) > tolerance_sq:
+                    current.append(interval_end)
+            else:
+                if len(current) >= 2:
+                    raw_chains.append(current)
+                current = [interval_start, interval_end]
+    if len(current) >= 2:
+        raw_chains.append(current)
+
+    chains = []
+    for raw_chain in raw_chains:
+        chain = _deduplicate_polyline(raw_chain)
+        section_start = 0
+        for index in range(1, len(chain) - 1):
+            if _face_boundary_descriptor(
+                face,
+                uv_layer,
+                chain[index],
+            ) is None:
+                continue
+            section = chain[section_start:index + 1]
+            if len(section) >= 2:
+                chains.append(section)
+            section_start = index
+        section = chain[section_start:]
+        if len(section) >= 2:
+            chains.append(section)
+
+    return [
+        chain
+        for chain in chains
+        if _face_boundary_descriptor(
+            face,
+            uv_layer,
+            chain[0],
+        ) is not None
+        and _face_boundary_descriptor(
+            face,
+            uv_layer,
+            chain[-1],
+        ) is not None
+        and _dist_sq(chain[0], chain[-1]) > tolerance_sq
+    ]
+
+
+def _barycentric_weights_2d(point, a, b, c):
+    denominator = (
+        (b[1] - c[1]) * (a[0] - c[0])
+        + (c[0] - b[0]) * (a[1] - c[1])
+    )
+    if abs(denominator) <= _UV_EPS:
+        return None
+    weight_a = (
+        (b[1] - c[1]) * (point[0] - c[0])
+        + (c[0] - b[0]) * (point[1] - c[1])
+    ) / denominator
+    weight_b = (
+        (c[1] - a[1]) * (point[0] - c[0])
+        + (a[0] - c[0]) * (point[1] - c[1])
+    ) / denominator
+    weight_c = 1.0 - weight_a - weight_b
+    return weight_a, weight_b, weight_c
+
+
+def _face_uv_to_3d(face, uv_layer, point):
+    loops = list(face.loops)
+    uv_points = [
+        (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
+        for loop in loops
+    ]
+    for loop, uv in zip(loops, uv_points):
+        if _dist_sq(point, uv) <= _UV_EPS * _UV_EPS:
+            return loop.vert.co.copy()
+
+    uv_vectors = [Vector((uv[0], uv[1], 0.0)) for uv in uv_points]
+    try:
+        triangles = tessellate_polygon([uv_vectors])
+    except (RuntimeError, ValueError):
+        triangles = ()
+
+    for triangle in triangles:
+        if all(isinstance(value, int) for value in triangle):
+            indices = list(triangle)
+        else:
+            indices = []
+            remaining = set(range(len(uv_vectors)))
+            for vector in triangle:
+                index = min(
+                    remaining,
+                    key=lambda candidate: (
+                        uv_vectors[candidate] - vector
+                    ).length_squared,
+                )
+                indices.append(index)
+                remaining.discard(index)
+        weights = _barycentric_weights_2d(
+            point,
+            uv_points[indices[0]],
+            uv_points[indices[1]],
+            uv_points[indices[2]],
+        )
+        if weights is None or min(weights) < -_FACTOR_EPS:
+            continue
+        coordinate = Vector((0.0, 0.0, 0.0))
+        for weight, index in zip(weights, indices):
+            coordinate += loops[index].vert.co * weight
+        return coordinate
+
+    nearest = _face_boundary_descriptor(
+        face,
+        uv_layer,
+        point,
+        nearest=True,
+    )
+    if nearest is not None:
+        loop = nearest["loop"]
+        projected, factor, _distance_sq = _project_point_to_segment(
+            point,
+            (loop[uv_layer].uv.x, loop[uv_layer].uv.y),
+            (
+                loop.link_loop_next[uv_layer].uv.x,
+                loop.link_loop_next[uv_layer].uv.y,
+            ),
+        )
+        del projected
+        return loop.vert.co.lerp(loop.link_loop_next.vert.co, factor)
+
+    coordinate = Vector((0.0, 0.0, 0.0))
+    for loop in loops:
+        coordinate += loop.vert.co
+    return coordinate / max(1, len(loops))
+
+
+def _collect_polyline_face_cut(
+    face,
+    uv_layer,
+    points,
+    edge_cut_buckets,
+):
+    point_chains = _polyline_face_point_chains(
+        face,
+        uv_layer,
+        points,
+    )
+    chains = []
+    for point_chain in point_chains:
+        nodes = []
+        valid = True
+        for index, point in enumerate(point_chain):
+            boundary = None
+            if index in {0, len(point_chain) - 1}:
+                boundary = _face_boundary_descriptor(
+                    face,
+                    uv_layer,
+                    point,
+                )
+                if boundary is None:
+                    valid = False
+                    break
+            if boundary is not None:
+                node = boundary
+                if node["edge"] is not None:
+                    edge_cut_buckets.setdefault(
+                        node["edge"],
+                        [],
+                    ).append(node)
+            else:
+                node = {
+                    "point": point,
+                    "edge": None,
+                    "edge_factor": None,
+                    "vert": None,
+                    "co": _face_uv_to_3d(face, uv_layer, point),
+                }
+            nodes.append(node)
+        if valid and len(nodes) >= 2:
+            chains.append(nodes)
+    if not chains:
+        return None
+    return {"face": face, "chains": chains}
+
+
+def _connect_face_chains(
+    bm,
+    face_records,
+    uv_layer,
+    all_target_faces,
+    mark_seams,
+):
+    cut_edges = set()
+    cut_faces = set()
+    edge_directions = {}
+    created_vertices = 0
+
+    for record in face_records:
+        original_face = record["face"]
+        if not original_face.is_valid:
+            continue
+        descendants = {original_face}
+
+        for chain in record["chains"]:
+            vert_a = chain[0]["vert"]
+            vert_b = chain[-1]["vert"]
+            if vert_a is None or vert_b is None or vert_a is vert_b:
+                continue
+            if not vert_a.is_valid or not vert_b.is_valid:
+                continue
+
+            candidate = None
+            for face in tuple(descendants):
+                if not face.is_valid:
+                    descendants.discard(face)
+                    continue
+                if vert_a in face.verts and vert_b in face.verts:
+                    candidate = face
+                    break
+            if candidate is None:
+                continue
+
+            coordinates = [
+                node["co"]
+                for node in chain[1:-1]
+            ]
+            old_edges = set(candidate.edges)
+            old_verts = set(candidate.verts)
+            selected = candidate.select
+            try:
+                split_result = bmesh.utils.face_split(
+                    candidate,
+                    vert_a,
+                    vert_b,
+                    coords=coordinates,
+                    use_exist=False,
+                )
+            except (RuntimeError, ValueError):
+                continue
+            if split_result is None:
+                continue
+            new_face, new_loop = split_result
+            if new_face is None or new_loop is None:
+                continue
+
+            candidate.select = selected
+            new_face.select = selected
+            descendants.add(new_face)
+            all_target_faces.add(new_face)
+            cut_faces.add(candidate)
+            cut_faces.add(new_face)
+
+            split_faces = {candidate, new_face}
+            new_edges = {
+                edge
+                for face in split_faces
+                for edge in face.edges
+                if edge not in old_edges
+            }
+            new_verts = {
+                vert
+                for face in split_faces
+                for vert in face.verts
+                if vert not in old_verts
+            }
+            created_vertices += len(new_verts)
+
+            available_verts = set(new_verts)
+            for node in chain[1:-1]:
+                if not available_verts:
+                    break
+                vert = min(
+                    available_verts,
+                    key=lambda candidate_vert: (
+                        candidate_vert.co - node["co"]
+                    ).length_squared,
+                )
+                node["vert"] = vert
+                available_verts.remove(vert)
+                for loop in vert.link_loops:
+                    if loop.face in descendants:
+                        loop[uv_layer].uv = node["point"]
+
+            chain_verts = [node["vert"] for node in chain]
+            for index, (path_vert_a, path_vert_b) in enumerate(
+                zip(chain_verts, chain_verts[1:])
+            ):
+                if path_vert_a is None or path_vert_b is None:
+                    continue
+                edge = bm.edges.get((path_vert_a, path_vert_b))
+                if edge is None or edge not in new_edges:
+                    continue
+                edge.select = True
+                path_vert_a.select = True
+                path_vert_b.select = True
+                if mark_seams:
+                    edge.seam = True
+                cut_edges.add(edge)
+                edge_directions[edge] = (
+                    chain[index]["point"],
+                    chain[index + 1]["point"],
+                )
+
+    return (
+        cut_edges,
+        cut_faces,
+        created_vertices,
+        edge_directions,
+    )
+
+
+def _positive_polyline_side_faces(
+    all_target_faces,
+    cut_edges,
+    edge_directions,
+    uv_layer,
+):
+    valid_faces = {face for face in all_target_faces if face.is_valid}
+    boundary_faces = {
+        face
+        for edge in cut_edges
+        for face in edge.link_faces
+        if face in valid_faces
+    }
+    components = []
+    face_components = {}
+    for seed in boundary_faces:
+        if seed in face_components:
+            continue
+        component_index = len(components)
+        component = {seed}
+        face_components[seed] = component_index
+        queue = deque([seed])
+        while queue:
+            face = queue.popleft()
+            for edge in face.edges:
+                if edge in cut_edges or edge.seam:
+                    continue
+                for neighbor in edge.link_faces:
+                    if neighbor is face or neighbor not in valid_faces:
+                        continue
+                    if neighbor in face_components:
+                        continue
+                    if not _uv_continuous_across(
+                        face,
+                        neighbor,
+                        edge,
+                        uv_layer,
+                    ):
+                        continue
+                    face_components[neighbor] = component_index
+                    component.add(neighbor)
+                    queue.append(neighbor)
+        components.append(component)
+
+    adjacency = {index: set() for index in range(len(components))}
+    positive_votes = [0 for _component in components]
+    for edge in cut_edges:
+        direction_points = edge_directions.get(edge)
+        if direction_points is None:
+            continue
+        linked_components = {
+            face_components[face]
+            for face in edge.link_faces
+            if face in face_components
+        }
+        for component_a in linked_components:
+            adjacency[component_a].update(
+                component_b
+                for component_b in linked_components
+                if component_b != component_a
+            )
+
+        origin, end = direction_points
+        direction = _sub2(end, origin)
+        for face in edge.link_faces:
+            if face not in face_components:
+                continue
+            loop = _loop_for_edge(face, edge)
+            if loop is None:
+                continue
+            side = 0.0
+            neighbor_loops = (
+                loop.link_loop_prev,
+                loop.link_loop_next.link_loop_next,
+            )
+            for neighbor_loop in neighbor_loops:
+                neighbor_uv = neighbor_loop[uv_layer].uv
+                side = _signed_distance(
+                    (neighbor_uv.x, neighbor_uv.y),
+                    origin,
+                    direction,
+                )
+                if abs(side) > _UV_EPS:
+                    break
+            if side > _UV_EPS:
+                positive_votes[face_components[face]] += 1
+
+    result = set()
+    visited_components = set()
+    for root in range(len(components)):
+        if root in visited_components or not adjacency[root]:
+            continue
+        colors = {root: 0}
+        group_queue = deque([root])
+        visited_components.add(root)
+        while group_queue:
+            component = group_queue.popleft()
+            for neighbor in adjacency[component]:
+                if neighbor not in colors:
+                    colors[neighbor] = 1 - colors[component]
+                    visited_components.add(neighbor)
+                    group_queue.append(neighbor)
+        vote_totals = [0, 0]
+        for component, color in colors.items():
+            vote_totals[color] += positive_votes[component]
+        selected_color = 0 if vote_totals[0] >= vote_totals[1] else 1
+        for component, color in colors.items():
+            if color == selected_color:
+                result.update(components[component])
+    return result
+
+
+def _cut_polyline_object(
+    obj,
+    points,
+    *,
+    target_mode,
+    split_uv_islands,
+    separation,
+    mark_seams,
+    sync_selection,
+):
+    mesh = obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    active_uv = mesh.uv_layers.active
+    if active_uv is None:
+        return {
+            "object": obj.name,
+            "target_faces": 0,
+            "cut_faces": 0,
+            "cut_edges": 0,
+            "new_vertices": 0,
+        }
+    uv_layer = bm.loops.layers.uv.get(active_uv.name)
+    if uv_layer is None:
+        return {
+            "object": obj.name,
+            "target_faces": 0,
+            "cut_faces": 0,
+            "cut_edges": 0,
+            "new_vertices": 0,
+        }
+
+    normalized_points = _deduplicate_polyline(points)
+    target_faces = _scope_faces(
+        bm,
+        uv_layer,
+        target_mode,
+        sync_selection,
+    )
+    if len(normalized_points) < 2:
+        return {
+            "object": obj.name,
+            "target_faces": len(target_faces),
+            "cut_faces": 0,
+            "cut_edges": 0,
+            "new_vertices": 0,
+        }
+
+    all_target_faces = set(target_faces)
+    edge_cut_buckets = {}
+    face_records = []
+    for face in target_faces:
+        if not face.is_valid or len(face.loops) < 3:
+            continue
+        record = _collect_polyline_face_cut(
+            face,
+            uv_layer,
+            normalized_points,
+            edge_cut_buckets,
+        )
+        if record is not None:
+            face_records.append(record)
+
+    boundary_vertices = _split_requested_edges(edge_cut_buckets)
+    (
+        cut_edges,
+        cut_faces,
+        interior_vertices,
+        edge_directions,
+    ) = _connect_face_chains(
+        bm,
+        face_records,
+        uv_layer,
+        all_target_faces,
+        mark_seams,
+    )
+
+    if split_uv_islands and cut_edges and separation > 0.0:
+        positive_faces = _positive_polyline_side_faces(
+            all_target_faces,
+            cut_edges,
+            edge_directions,
+            uv_layer,
+        )
+        direction = None
+        for point_a, point_b in zip(
+            normalized_points,
+            normalized_points[1:],
+        ):
+            candidate = _sub2(point_b, point_a)
+            if candidate[0] * candidate[0] + candidate[1] * candidate[1] > _UV_EPS:
+                direction = candidate
+                break
+        if direction is not None:
+            _shift_uv_faces(
+                positive_faces,
+                uv_layer,
+                direction,
+                separation,
+            )
+
+    new_vertices = boundary_vertices + interior_vertices
+    if cut_edges or new_vertices:
+        bm.select_flush_mode()
+        bmesh.update_edit_mesh(
+            mesh,
+            loop_triangles=True,
+            destructive=True,
+        )
+
+    return {
+        "object": obj.name,
+        "target_faces": len(target_faces),
+        "cut_faces": len({face for face in cut_faces if face.is_valid}),
+        "cut_edges": len({edge for edge in cut_edges if edge.is_valid}),
+        "new_vertices": new_vertices,
+    }
+
+
 def _edge_uv_pair(edge, uv_layer):
     for face in edge.link_faces:
         loop = _loop_for_edge(face, edge)
@@ -1109,13 +1861,10 @@ def _draw_batch_knife(operator):
     ):
         return
 
-    start = operator._pixel_start
     end = operator._pixel_end
-    if start is None:
-        return
-
     if end is None:
-        end = start
+        return
+    start = operator._pixel_start if operator._pixel_start is not None else end
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
@@ -1131,7 +1880,7 @@ def _draw_batch_knife(operator):
         )
     )
 
-    if operator.cut_mode == "GRID":
+    if operator.cut_mode == "GRID" and operator._stage == 1:
         positions = []
         for segment_start, segment_end in operator._grid_segments_pixel:
             positions.extend((segment_start, segment_end))
@@ -1143,31 +1892,65 @@ def _draw_batch_knife(operator):
             )
             shader.uniform_float("color", line_color)
             grid_batch.draw(shader)
-    else:
-        line_start, line_end = (
-            _extended_preview_points(start, end)
-            if operator.extend_line
-            else (start, end)
-        )
-        line_batch = batch_for_shader(
-            shader,
-            "LINES",
-            {"pos": (line_start, line_end)},
-        )
-        shader.uniform_float("color", line_color)
-        line_batch.draw(shader)
+    elif operator.cut_mode == "LINE" and operator._stage == 1:
+        if operator.line_mode == "MULTI":
+            positions = []
+            committed = list(operator._path_pixel_points)
+            for point_a, point_b in zip(committed, committed[1:]):
+                positions.extend((point_a, point_b))
+            if committed and _dist_sq(committed[-1], end) > 1.0:
+                positions.extend((committed[-1], end))
+            if positions:
+                line_batch = batch_for_shader(
+                    shader,
+                    "LINES",
+                    {"pos": positions},
+                )
+                shader.uniform_float("color", line_color)
+                line_batch.draw(shader)
+        else:
+            line_start, line_end = (
+                _extended_preview_points(start, end)
+                if operator.line_mode == "INFINITE"
+                else (start, end)
+            )
+            line_batch = batch_for_shader(
+                shader,
+                "LINES",
+                {"pos": (line_start, line_end)},
+            )
+            shader.uniform_float("color", line_color)
+            line_batch.draw(shader)
 
-    gpu.state.point_size_set(7.0)
-    point_positions = [start]
+    fixed_points = []
     if operator._stage == 1:
-        point_positions.append(end)
-    point_batch = batch_for_shader(
+        if operator.cut_mode == "LINE" and operator.line_mode == "MULTI":
+            fixed_points = list(operator._path_pixel_points)
+        else:
+            fixed_points = [start]
+    if fixed_points:
+        gpu.state.point_size_set(7.0)
+        point_batch = batch_for_shader(
+            shader,
+            "POINTS",
+            {"pos": fixed_points},
+        )
+        shader.uniform_float("color", (1.0, 0.7, 0.1, 1.0))
+        point_batch.draw(shader)
+
+    gpu.state.point_size_set(9.0 if operator._stage == 0 else 7.0)
+    cursor_batch = batch_for_shader(
         shader,
         "POINTS",
-        {"pos": point_positions},
+        {"pos": (end,)},
     )
-    shader.uniform_float("color", (1.0, 0.7, 0.1, 1.0))
-    point_batch.draw(shader)
+    cursor_color = (
+        (0.15, 1.0, 0.35, 1.0)
+        if operator._point_snap_hit
+        else (1.0, 0.7, 0.1, 1.0)
+    )
+    shader.uniform_float("color", cursor_color)
+    cursor_batch.draw(shader)
 
     if (
         operator.cut_mode == "GRID"
@@ -1191,7 +1974,21 @@ def _draw_batch_knife(operator):
         blf.size(0, 14.0)
         blf.color(0, 1.0, 1.0, 1.0, 1.0)
         blf.draw(0, label)
-    elif operator._stage == 1:
+    elif operator.cut_mode == "LINE":
+        point_count = (
+            f" | Points {len(operator._path_uv_points)}"
+            if operator.line_mode == "MULTI"
+            else ""
+        )
+        blf.position(0, end[0] + 14.0, end[1] + 14.0, 0.0)
+        blf.size(0, 14.0)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(
+            0,
+            f"{operator._line_mode_label()} | "
+            f"{operator._snap_mode_label(context)}{point_count}",
+        )
+    else:
         blf.position(0, end[0] + 14.0, end[1] + 14.0, 0.0)
         blf.size(0, 14.0)
         blf.color(0, 1.0, 1.0, 1.0, 1.0)
@@ -1236,6 +2033,28 @@ class UV_OT_batch_knife(bpy.types.Operator):
             ("GRID", "Grid", "Cut everything inside a square grid"),
         ),
         default="LINE",
+    )
+    line_mode: EnumProperty(
+        name="Line Mode",
+        description="Choose a finite, infinite, or multi-point cut",
+        items=(
+            (
+                "FINITE",
+                "Point to Point",
+                "Cut only along the segment between two points",
+            ),
+            (
+                "INFINITE",
+                "Infinite Line",
+                "Extend the line infinitely in both directions",
+            ),
+            (
+                "MULTI",
+                "Multi-Point",
+                "Place a polyline of Knife points and confirm with Enter",
+            ),
+        ),
+        default="FINITE",
     )
     extend_line: BoolProperty(
         name="Extend Line",
@@ -1317,6 +2136,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
     _snap_points = None
     _snap_caches = None
     _current_grid_snap_step = None
+    _path_pixel_points = ()
+    _path_uv_points = ()
     _grid_segments_pixel = ()
     _grid_preview_size = 0.0
     _grid_preview_angle = 0.0
@@ -1346,7 +2167,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
             layout.prop(self, "grid_angle")
             layout.prop(self, "grid_subdivisions")
         else:
-            layout.prop(self, "extend_line")
+            layout.prop(self, "line_mode")
         layout.separator()
         layout.prop(self, "split_uv_islands")
         sub = layout.column()
@@ -1446,6 +2267,13 @@ class UV_OT_batch_knife(bpy.types.Operator):
         if abs(steps[0] - steps[1]) <= _UV_EPS:
             return f"{label} ({steps[0]:.6g} UV)"
         return f"{label} ({steps[0]:.6g} x {steps[1]:.6g} UV)"
+
+    def _line_mode_label(self):
+        return {
+            "FINITE": "C1 Point to Point",
+            "INFINITE": "C2 Infinite Line",
+            "MULTI": "C3 Multi-Point",
+        }.get(self.line_mode, "C1 Point to Point")
 
     def _build_snap_cache(self, context):
         self._snap_tree = None
@@ -1704,11 +2532,17 @@ class UV_OT_batch_knife(bpy.types.Operator):
             lock_text = " | X: горизонталь зафиксирована"
         elif self._axis_lock == "Y":
             lock_text = " | Y: вертикаль зафиксирована"
-        line_text = "бесконечная" if self.extend_line else "от точки до точки"
+        line_text = self._line_mode_label()
+        multi_text = (
+            " Enter — завершить; Backspace — удалить точку;"
+            if self.line_mode == "MULTI"
+            else ""
+        )
         context.workspace.status_text_set(
-            f"UV Batch Knife: линия {line_text}; "
+            f"UV Batch Knife: {line_text}; "
             f"S — режим снапа: {snap_text}; "
-            "C — тип линии; Ctrl — ближайшая ось; X/Y — фиксация оси; "
+            f"C — тип линии;{multi_text} "
+            "Ctrl — ближайшая ось; X/Y — фиксация оси; "
             "G — режим грида; ПКМ/Esc — отмена"
             + lock_text
         )
@@ -1717,6 +2551,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
         self.cut_mode = "LINE"
+        self.line_mode = "FINITE"
         self.extend_line = False
         self.grid_subdivisions = 2
         self._pixel_start = None
@@ -1733,6 +2568,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._snap_points = None
         self._snap_caches = {}
         self._current_grid_snap_step = None
+        self._path_pixel_points = []
+        self._path_uv_points = []
         self._grid_segments_pixel = ()
         self._grid_preview_size = 0.0
         self._grid_preview_angle = 0.0
@@ -1818,7 +2655,20 @@ class UV_OT_batch_knife(bpy.types.Operator):
             and event.type == "C"
             and event.value == "PRESS"
         ):
-            self.extend_line = not self.extend_line
+            previous_mode = self.line_mode
+            mode_index = _LINE_MODES.index(self.line_mode)
+            self.line_mode = _LINE_MODES[
+                (mode_index + 1) % len(_LINE_MODES)
+            ]
+            self.extend_line = self.line_mode == "INFINITE"
+            if (
+                previous_mode == "MULTI"
+                and self.line_mode != "MULTI"
+                and self._path_pixel_points
+            ):
+                self._path_pixel_points = [self._path_pixel_points[0]]
+                self._path_uv_points = [self._path_uv_points[0]]
+                self._pixel_start = self._path_pixel_points[0]
             self._set_status_text(context)
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
@@ -1828,6 +2678,10 @@ class UV_OT_batch_knife(bpy.types.Operator):
             self._axis_lock = None
             self._active_axis = None
             self._grid_segments_pixel = ()
+            if self._path_pixel_points:
+                self._path_pixel_points = [self._path_pixel_points[0]]
+                self._path_uv_points = [self._path_uv_points[0]]
+                self._pixel_start = self._path_pixel_points[0]
             if self._stage == 1:
                 if self.cut_mode == "GRID":
                     self._update_grid_preview(
@@ -1842,6 +2696,50 @@ class UV_OT_batch_knife(bpy.types.Operator):
                         self._pixel_raw_end,
                         nearest_axis=False,
                     )
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if (
+            self.cut_mode == "LINE"
+            and self.line_mode == "MULTI"
+            and self._stage == 1
+            and event.type in {"RET", "NUMPAD_ENTER"}
+            and event.value == "PRESS"
+        ):
+            if len(self._path_uv_points) < 2:
+                return {"RUNNING_MODAL"}
+            self._finish_modal(context)
+            return self.execute(context)
+
+        if (
+            self.cut_mode == "LINE"
+            and self.line_mode == "MULTI"
+            and self._stage == 1
+            and event.type == "BACK_SPACE"
+            and event.value == "PRESS"
+        ):
+            if len(self._path_pixel_points) > 1:
+                self._path_pixel_points.pop()
+                self._path_uv_points.pop()
+                self._pixel_start = self._path_pixel_points[-1]
+                self._start_snap_uv = self._path_uv_points[-1]
+                self._pixel_end = self._update_pointer(
+                    context,
+                    self._pixel_raw_end,
+                    nearest_axis=False,
+                )
+            else:
+                self._path_pixel_points = []
+                self._path_uv_points = []
+                self._pixel_start = None
+                self._start_snap_uv = None
+                self._stage = 0
+                self._pixel_end = self._update_pointer(
+                    context,
+                    self._pixel_raw_end,
+                    nearest_axis=False,
+                )
             self._set_status_text(context)
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
@@ -1894,9 +2792,18 @@ class UV_OT_batch_knife(bpy.types.Operator):
                     raw_point,
                     nearest_axis=False,
                 )
+                point_uv = (
+                    self._current_snap_uv
+                    if self._current_snap_uv is not None
+                    else context.region.view2d.region_to_view(*point)
+                )
                 self._pixel_start = point
                 self._pixel_end = point
                 self._start_snap_uv = self._current_snap_uv
+                self._path_pixel_points = [point]
+                self._path_uv_points = [
+                    (float(point_uv[0]), float(point_uv[1]))
+                ]
                 self._stage = 1
                 if self.cut_mode == "GRID":
                     self._grid_preview_size = 0.0
@@ -1949,6 +2856,24 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 end_uv = (end_uv[0], start_uv[1])
             elif self._active_axis == "Y":
                 end_uv = (start_uv[0], end_uv[1])
+
+            if self.line_mode == "MULTI":
+                committed_pixel = (
+                    float(self._pixel_end[0]),
+                    float(self._pixel_end[1]),
+                )
+                committed_uv = (float(end_uv[0]), float(end_uv[1]))
+                self._path_pixel_points.append(committed_pixel)
+                self._path_uv_points.append(committed_uv)
+                self._pixel_start = committed_pixel
+                self._start_snap_uv = committed_uv
+                self._pixel_end = committed_pixel
+                self._active_axis = None
+                self._snap_active = self._point_snap_hit
+                self._set_status_text(context)
+                context.area.tag_redraw()
+                return {"RUNNING_MODAL"}
+
             self.start_uv = start_uv
             self.end_uv = end_uv
             self._finish_modal(context)
@@ -1984,33 +2909,51 @@ class UV_OT_batch_knife(bpy.types.Operator):
                     )
                 )
         else:
-            origin = (float(self.start_uv[0]), float(self.start_uv[1]))
-            end = (float(self.end_uv[0]), float(self.end_uv[1]))
-            direction = _sub2(end, origin)
-            if (
-                direction[0] * direction[0]
-                + direction[1] * direction[1]
-                <= _UV_EPS
-            ):
+            if self.line_mode == "MULTI":
+                path_points = _deduplicate_polyline(
+                    self._path_uv_points
+                )
+            else:
+                path_points = [
+                    (float(self.start_uv[0]), float(self.start_uv[1])),
+                    (float(self.end_uv[0]), float(self.end_uv[1])),
+                ]
+            if len(path_points) < 2:
                 self.report(
                     {"WARNING"},
                     "Линия UV Batch Knife слишком короткая",
                 )
                 return {"CANCELLED"}
+
+            origin = path_points[0]
+            direction = _sub2(path_points[-1], origin)
             for obj in _edit_mesh_objects(context):
-                results.append(
-                    _cut_object(
-                        obj,
-                        origin,
-                        direction,
-                        target_mode=self.target_mode,
-                        extend_line=self.extend_line,
-                        split_uv_islands=self.split_uv_islands,
-                        separation=self.separation,
-                        mark_seams=self.mark_seams,
-                        sync_selection=sync_selection,
+                if self.line_mode == "INFINITE":
+                    results.append(
+                        _cut_object(
+                            obj,
+                            origin,
+                            direction,
+                            target_mode=self.target_mode,
+                            extend_line=True,
+                            split_uv_islands=self.split_uv_islands,
+                            separation=self.separation,
+                            mark_seams=self.mark_seams,
+                            sync_selection=sync_selection,
+                        )
                     )
-                )
+                else:
+                    results.append(
+                        _cut_polyline_object(
+                            obj,
+                            path_points,
+                            target_mode=self.target_mode,
+                            split_uv_islands=self.split_uv_islands,
+                            separation=self.separation,
+                            mark_seams=self.mark_seams,
+                            sync_selection=sync_selection,
+                        )
+                    )
 
         cut_edges = sum(item["cut_edges"] for item in results)
         cut_faces = sum(item["cut_faces"] for item in results)
