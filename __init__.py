@@ -52,7 +52,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.6"
+_ADDON_VERSION = "1.5.7"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -1667,6 +1667,88 @@ def _deduplicate_polyline(points):
     return result
 
 
+def _polyline_segment_intersection(start_a, end_a, start_b, end_b):
+    direction_a = _sub2(end_a, start_a)
+    direction_b = _sub2(end_b, start_b)
+    denominator = _cross2(direction_a, direction_b)
+    if abs(denominator) <= _UV_EPS:
+        return None
+
+    offset = _sub2(start_b, start_a)
+    factor_a = _cross2(offset, direction_b) / denominator
+    factor_b = _cross2(offset, direction_a) / denominator
+    if not (
+        -_FACTOR_EPS <= factor_a <= 1.0 + _FACTOR_EPS
+        and -_FACTOR_EPS <= factor_b <= 1.0 + _FACTOR_EPS
+    ):
+        return None
+
+    factor_a = min(1.0, max(0.0, factor_a))
+    factor_b = min(1.0, max(0.0, factor_b))
+    point_a = (
+        start_a[0] + direction_a[0] * factor_a,
+        start_a[1] + direction_a[1] * factor_a,
+    )
+    point_b = (
+        start_b[0] + direction_b[0] * factor_b,
+        start_b[1] + direction_b[1] * factor_b,
+    )
+    point = (
+        (point_a[0] + point_b[0]) * 0.5,
+        (point_a[1] + point_b[1]) * 0.5,
+    )
+    return factor_a, factor_b, point
+
+
+def _planarize_polyline(points):
+    """Insert every non-collinear self-intersection into both segments."""
+    working = _deduplicate_polyline(points)
+    if len(working) < 4:
+        return working
+
+    segment_count = len(working) - 1
+    split_points = [
+        [(0.0, working[index]), (1.0, working[index + 1])]
+        for index in range(segment_count)
+    ]
+    closed = _dist_sq(working[0], working[-1]) <= (
+        _FACTOR_EPS * _FACTOR_EPS
+    )
+
+    for first_index in range(segment_count):
+        for second_index in range(first_index + 1, segment_count):
+            if second_index == first_index + 1:
+                continue
+            if (
+                closed
+                and first_index == 0
+                and second_index == segment_count - 1
+            ):
+                continue
+            intersection = _polyline_segment_intersection(
+                working[first_index],
+                working[first_index + 1],
+                working[second_index],
+                working[second_index + 1],
+            )
+            if intersection is None:
+                continue
+            first_factor, second_factor, point = intersection
+            split_points[first_index].append((first_factor, point))
+            split_points[second_index].append((second_factor, point))
+
+    result = []
+    tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
+    for points_on_segment in split_points:
+        points_on_segment.sort(key=lambda item: item[0])
+        for _factor, point in points_on_segment:
+            normalized = (float(point[0]), float(point[1]))
+            if result and _dist_sq(result[-1], normalized) <= tolerance_sq:
+                continue
+            result.append(normalized)
+    return result
+
+
 def _polyline_face_point_chains(
     face,
     uv_layer,
@@ -1681,37 +1763,44 @@ def _polyline_face_point_chains(
     if len(working) < 2 or len(polygon) < 3:
         return []
 
-    start_boundary = _face_boundary_descriptor(
-        face,
-        uv_layer,
-        working[0],
+    closed = (
+        len(working) >= 4
+        and _dist_sq(working[0], working[-1])
+        <= _FACTOR_EPS * _FACTOR_EPS
     )
-    if _point_in_polygon(working[0], polygon) and start_boundary is None:
-        boundary_point = _interior_endpoint_boundary_point(
+
+    if not closed:
+        start_boundary = _face_boundary_descriptor(
             face,
             uv_layer,
             working[0],
-            polygon,
-            endpoint_extension_mode,
         )
-        if boundary_point is not None:
-            working.insert(0, boundary_point)
+        if _point_in_polygon(working[0], polygon) and start_boundary is None:
+            boundary_point = _interior_endpoint_boundary_point(
+                face,
+                uv_layer,
+                working[0],
+                polygon,
+                endpoint_extension_mode,
+            )
+            if boundary_point is not None:
+                working.insert(0, boundary_point)
 
-    end_boundary = _face_boundary_descriptor(
-        face,
-        uv_layer,
-        working[-1],
-    )
-    if _point_in_polygon(working[-1], polygon) and end_boundary is None:
-        boundary_point = _interior_endpoint_boundary_point(
+        end_boundary = _face_boundary_descriptor(
             face,
             uv_layer,
             working[-1],
-            polygon,
-            endpoint_extension_mode,
         )
-        if boundary_point is not None:
-            working.append(boundary_point)
+        if _point_in_polygon(working[-1], polygon) and end_boundary is None:
+            boundary_point = _interior_endpoint_boundary_point(
+                face,
+                uv_layer,
+                working[-1],
+                polygon,
+                endpoint_extension_mode,
+            )
+            if boundary_point is not None:
+                working.append(boundary_point)
 
     raw_chains = []
     current = []
@@ -1760,21 +1849,30 @@ def _polyline_face_point_chains(
         if len(section) >= 2:
             chains.append(section)
 
-    return [
-        chain
-        for chain in chains
-        if _face_boundary_descriptor(
-            face,
-            uv_layer,
-            chain[0],
-        ) is not None
-        and _face_boundary_descriptor(
-            face,
-            uv_layer,
-            chain[-1],
-        ) is not None
-        and _dist_sq(chain[0], chain[-1]) > tolerance_sq
-    ]
+    result = []
+    for chain in chains:
+        chain_closed = (
+            len(chain) >= 4
+            and _dist_sq(chain[0], chain[-1]) <= tolerance_sq
+        )
+        if chain_closed:
+            result.append(chain)
+            continue
+        if (
+            _face_boundary_descriptor(
+                face,
+                uv_layer,
+                chain[0],
+            ) is not None
+            and _face_boundary_descriptor(
+                face,
+                uv_layer,
+                chain[-1],
+            ) is not None
+            and _dist_sq(chain[0], chain[-1]) > tolerance_sq
+        ):
+            result.append(chain)
+    return result
 
 
 def _barycentric_weights_2d(point, a, b, c):
@@ -1879,41 +1977,139 @@ def _collect_polyline_face_cut(
         endpoint_extension_mode,
     )
     chains = []
+    node_cache = {}
     for point_chain in point_chains:
         nodes = []
         valid = True
+        chain_closed = (
+            len(point_chain) >= 4
+            and _dist_sq(point_chain[0], point_chain[-1])
+            <= _FACTOR_EPS * _FACTOR_EPS
+        )
         for index, point in enumerate(point_chain):
-            boundary = None
-            if index in {0, len(point_chain) - 1}:
-                boundary = _face_boundary_descriptor(
-                    face,
-                    uv_layer,
-                    point,
-                )
-                if boundary is None:
-                    valid = False
-                    break
-            if boundary is not None:
-                node = boundary
-                if node["edge"] is not None:
-                    edge_cut_buckets.setdefault(
-                        node["edge"],
-                        [],
-                    ).append(node)
-            else:
-                node = {
-                    "point": point,
-                    "edge": None,
-                    "edge_factor": None,
-                    "vert": None,
-                    "co": _face_uv_to_3d(face, uv_layer, point),
-                }
+            boundary = _face_boundary_descriptor(
+                face,
+                uv_layer,
+                point,
+            )
+            if (
+                not chain_closed
+                and index in {0, len(point_chain) - 1}
+                and boundary is None
+            ):
+                valid = False
+                break
+            key = (
+                round(float(point[0]) / _FACTOR_EPS),
+                round(float(point[1]) / _FACTOR_EPS),
+            )
+            node = node_cache.get(key)
+            if node is None:
+                if boundary is not None:
+                    node = boundary
+                    if node["edge"] is not None:
+                        edge_cut_buckets.setdefault(
+                            node["edge"],
+                            [],
+                        ).append(node)
+                else:
+                    node = {
+                        "point": point,
+                        "edge": None,
+                        "edge_factor": None,
+                        "vert": None,
+                        "co": _face_uv_to_3d(face, uv_layer, point),
+                    }
+                node_cache[key] = node
             nodes.append(node)
         if valid and len(nodes) >= 2:
             chains.append(nodes)
     if not chains:
         return None
     return {"face": face, "chains": chains}
+
+
+def _segments_cross_except_shared_endpoints(a, b, c, d):
+    intersection = _polyline_segment_intersection(a, b, c, d)
+    tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
+    if intersection is not None:
+        _factor_a, _factor_b, point = intersection
+        shared = any(
+            _dist_sq(first, second) <= tolerance_sq
+            and _dist_sq(point, first) <= tolerance_sq
+            for first in (a, b)
+            for second in (c, d)
+        )
+        return not shared
+
+    direction_ab = _sub2(b, a)
+    if (
+        abs(_cross2(direction_ab, _sub2(c, a))) > _UV_EPS
+        or abs(_cross2(direction_ab, _sub2(d, a))) > _UV_EPS
+    ):
+        return False
+    axis = 0 if abs(direction_ab[0]) >= abs(direction_ab[1]) else 1
+    first_min, first_max = sorted((a[axis], b[axis]))
+    second_min, second_max = sorted((c[axis], d[axis]))
+    overlap = min(first_max, second_max) - max(first_min, second_min)
+    return overlap > _FACTOR_EPS
+
+
+def _segment_visible_in_polygon(start, end, polygon):
+    intervals = _segment_inside_polygon_intervals(start, end, polygon)
+    if len(intervals) != 1:
+        return False
+    interval_start, interval_end = intervals[0]
+    tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
+    return (
+        _dist_sq(interval_start, start) <= tolerance_sq
+        and _dist_sq(interval_end, end) <= tolerance_sq
+    )
+
+
+def _graph_cycle_vertex_sets(adjacency, component):
+    if not component:
+        return []
+    root = next(iter(component))
+    parent = {root: None}
+    stack = [root]
+    tree_edges = set()
+    while stack:
+        vert = stack.pop()
+        for neighbor in adjacency.get(vert, ()):
+            edge_key = frozenset((vert, neighbor))
+            if neighbor not in parent:
+                parent[neighbor] = vert
+                tree_edges.add(edge_key)
+                stack.append(neighbor)
+
+    cycles = []
+    seen_edges = set()
+    for vert in component:
+        for neighbor in adjacency.get(vert, ()):
+            edge_key = frozenset((vert, neighbor))
+            if edge_key in tree_edges or edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            ancestors = set()
+            cursor = vert
+            while cursor is not None:
+                ancestors.add(cursor)
+                cursor = parent.get(cursor)
+            cursor = neighbor
+            neighbor_path = []
+            while cursor not in ancestors:
+                neighbor_path.append(cursor)
+                cursor = parent.get(cursor)
+            common = cursor
+            cycle = {common, *neighbor_path}
+            cursor = vert
+            while cursor is not common:
+                cycle.add(cursor)
+                cursor = parent.get(cursor)
+            if len(cycle) >= 3 and cycle not in cycles:
+                cycles.append(cycle)
+    return cycles
 
 
 def _connect_face_chains(
@@ -1932,107 +2128,245 @@ def _connect_face_chains(
         original_face = record["face"]
         if not original_face.is_valid:
             continue
-        descendants = {original_face}
 
+        selected = original_face.select
+        polygon = [
+            (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
+            for loop in original_face.loops
+        ]
+        boundary_uvs = {
+            loop.vert: (
+                float(loop[uv_layer].uv.x),
+                float(loop[uv_layer].uv.y),
+            )
+            for loop in original_face.loops
+        }
+        boundary_verts = set(boundary_uvs)
+
+        nodes = []
+        node_ids = set()
+        path_pairs = []
+        pair_ids = set()
         for chain in record["chains"]:
-            vert_a = chain[0]["vert"]
-            vert_b = chain[-1]["vert"]
-            if vert_a is None or vert_b is None or vert_a is vert_b:
-                continue
-            if not vert_a.is_valid or not vert_b.is_valid:
-                continue
-
-            candidate = None
-            for face in tuple(descendants):
-                if not face.is_valid:
-                    descendants.discard(face)
+            for node in chain:
+                if id(node) not in node_ids:
+                    nodes.append(node)
+                    node_ids.add(id(node))
+            for first, second in zip(chain, chain[1:]):
+                if first is second:
                     continue
-                if vert_a in face.verts and vert_b in face.verts:
-                    candidate = face
-                    break
-            if candidate is None:
-                continue
+                pair_key = frozenset((id(first), id(second)))
+                if len(pair_key) < 2 or pair_key in pair_ids:
+                    continue
+                pair_ids.add(pair_key)
+                path_pairs.append((first, second))
+        if not path_pairs:
+            continue
 
-            coordinates = [
-                node["co"]
-                for node in chain[1:-1]
-            ]
-            old_edges = set(candidate.edges)
-            old_verts = set(candidate.verts)
-            selected = candidate.select
-            try:
-                split_result = bmesh.utils.face_split(
-                    candidate,
-                    vert_a,
-                    vert_b,
-                    coords=coordinates,
-                    use_exist=False,
+        interior_nodes = []
+        vertex_points = dict(boundary_uvs)
+        for node in nodes:
+            vert = node["vert"]
+            if vert is not None and vert.is_valid:
+                vertex_points[vert] = (
+                    float(node["point"][0]),
+                    float(node["point"][1]),
                 )
-            except (RuntimeError, ValueError):
                 continue
-            if split_result is None:
-                continue
-            new_face, new_loop = split_result
-            if new_face is None or new_loop is None:
-                continue
+            vert = bm.verts.new(node["co"])
+            node["vert"] = vert
+            interior_nodes.append(node)
+            vertex_points[vert] = (
+                float(node["point"][0]),
+                float(node["point"][1]),
+            )
 
-            candidate.select = selected
-            new_face.select = selected
-            descendants.add(new_face)
-            all_target_faces.add(new_face)
-            cut_faces.add(candidate)
-            cut_faces.add(new_face)
-
-            split_faces = {candidate, new_face}
-            new_edges = {
-                edge
-                for face in split_faces
-                for edge in face.edges
-                if edge not in old_edges
-            }
-            new_verts = {
-                vert
-                for face in split_faces
-                for vert in face.verts
-                if vert not in old_verts
-            }
-            created_vertices += len(new_verts)
-
-            available_verts = set(new_verts)
-            for node in chain[1:-1]:
-                if not available_verts:
-                    break
-                vert = min(
-                    available_verts,
-                    key=lambda candidate_vert: (
-                        candidate_vert.co - node["co"]
-                    ).length_squared,
-                )
-                node["vert"] = vert
-                available_verts.remove(vert)
-                for loop in vert.link_loops:
-                    if loop.face in descendants:
-                        loop[uv_layer].uv = node["point"]
-
-            chain_verts = [node["vert"] for node in chain]
-            for index, (path_vert_a, path_vert_b) in enumerate(
-                zip(chain_verts, chain_verts[1:])
+        path_edges = set()
+        path_edge_directions = {}
+        new_wire_edges = set()
+        adjacency = {}
+        path_segments = []
+        for first, second in path_pairs:
+            vert_a = first["vert"]
+            vert_b = second["vert"]
+            if (
+                vert_a is None
+                or vert_b is None
+                or vert_a is vert_b
+                or not vert_a.is_valid
+                or not vert_b.is_valid
             ):
-                if path_vert_a is None or path_vert_b is None:
-                    continue
-                edge = bm.edges.get((path_vert_a, path_vert_b))
-                if edge is None or edge not in new_edges:
-                    continue
-                edge.select = True
-                path_vert_a.select = True
-                path_vert_b.select = True
-                if mark_seams:
-                    edge.seam = True
-                cut_edges.add(edge)
-                edge_directions[edge] = (
-                    chain[index]["point"],
-                    chain[index + 1]["point"],
+                continue
+            edge = bm.edges.get((vert_a, vert_b))
+            if edge is None:
+                edge = bm.edges.new((vert_a, vert_b))
+                new_wire_edges.add(edge)
+            elif edge in original_face.edges:
+                continue
+            path_edges.add(edge)
+            path_edge_directions.setdefault(
+                edge,
+                (first["point"], second["point"]),
+            )
+            adjacency.setdefault(vert_a, set()).add(vert_b)
+            adjacency.setdefault(vert_b, set()).add(vert_a)
+            path_segments.append((first["point"], second["point"]))
+
+        if not path_edges:
+            for node in interior_nodes:
+                vert = node["vert"]
+                if vert is not None and vert.is_valid and not vert.link_edges:
+                    bm.verts.remove(vert)
+                node["vert"] = None
+            continue
+
+        support_edges = set()
+        support_segments = []
+        remaining = set(adjacency)
+        while remaining:
+            seed = remaining.pop()
+            component = {seed}
+            queue = [seed]
+            while queue:
+                vert = queue.pop()
+                for neighbor in adjacency.get(vert, ()):
+                    if neighbor not in component:
+                        component.add(neighbor)
+                        remaining.discard(neighbor)
+                        queue.append(neighbor)
+
+            anchors = component & boundary_verts
+            used_sources = set()
+
+            def add_support(source_pool):
+                candidates = []
+                available_boundaries = boundary_verts - anchors
+                if not available_boundaries:
+                    available_boundaries = set(boundary_verts)
+                for source in source_pool:
+                    if source in boundary_verts or source in used_sources:
+                        continue
+                    source_point = vertex_points[source]
+                    for boundary in available_boundaries:
+                        boundary_point = boundary_uvs[boundary]
+                        if not _segment_visible_in_polygon(
+                            source_point,
+                            boundary_point,
+                            polygon,
+                        ):
+                            continue
+                        if any(
+                            _segments_cross_except_shared_endpoints(
+                                source_point,
+                                boundary_point,
+                                segment_start,
+                                segment_end,
+                            )
+                            for segment_start, segment_end in (
+                                path_segments + support_segments
+                            )
+                        ):
+                            continue
+                        candidates.append(
+                            (
+                                _dist_sq(source_point, boundary_point),
+                                source_point[0],
+                                source_point[1],
+                                boundary_point[0],
+                                boundary_point[1],
+                                source,
+                                boundary,
+                            )
+                        )
+                if not candidates:
+                    return None
+                *_sort_values, source, boundary = min(candidates)
+                edge = bm.edges.get((source, boundary))
+                if edge is None:
+                    edge = bm.edges.new((source, boundary))
+                    new_wire_edges.add(edge)
+                support_edges.add(edge)
+                support_segments.append(
+                    (vertex_points[source], boundary_uvs[boundary])
                 )
+                used_sources.add(source)
+                anchors.add(boundary)
+                return source
+
+            while len(anchors) < 2:
+                if add_support(component) is None:
+                    break
+
+            for cycle in _graph_cycle_vertex_sets(adjacency, component):
+                attachments = {
+                    vert
+                    for vert in cycle
+                    if vert in boundary_verts
+                    or vert in used_sources
+                    or any(
+                        neighbor not in cycle
+                        for neighbor in adjacency.get(vert, ())
+                    )
+                }
+                while len(attachments) < 2:
+                    source = add_support(cycle - attachments)
+                    if source is None:
+                        break
+                    attachments.add(source)
+
+        edgenet = {
+            edge
+            for edge in path_edges | support_edges
+            if edge.is_valid and not edge.link_faces
+        }
+        original_face.normal_update()
+        try:
+            split_result = bmesh.utils.face_split_edgenet(
+                original_face,
+                tuple(edgenet),
+            )
+        except (RuntimeError, ValueError):
+            split_result = ()
+
+        result_faces = {
+            face for face in split_result
+            if face is not None and face.is_valid
+        }
+        if not result_faces:
+            for edge in tuple(new_wire_edges):
+                if edge.is_valid and not edge.link_faces:
+                    bm.edges.remove(edge)
+            for node in interior_nodes:
+                vert = node["vert"]
+                if vert is not None and vert.is_valid and not vert.link_edges:
+                    bm.verts.remove(vert)
+                node["vert"] = None
+            continue
+
+        for face in result_faces:
+            face.select = selected
+        all_target_faces.update(result_faces)
+        cut_faces.update(result_faces)
+        created_vertices += len(interior_nodes)
+
+        for node in interior_nodes:
+            vert = node["vert"]
+            if vert is None or not vert.is_valid:
+                continue
+            for loop in vert.link_loops:
+                if loop.face in result_faces:
+                    loop[uv_layer].uv = node["point"]
+
+        for edge in path_edges:
+            if not edge.is_valid or not edge.link_faces:
+                continue
+            edge.select = True
+            for vert in edge.verts:
+                vert.select = True
+            if mark_seams:
+                edge.seam = True
+            cut_edges.add(edge)
+            edge_directions[edge] = path_edge_directions[edge]
 
     return (
         cut_edges,
@@ -2188,7 +2522,7 @@ def _cut_polyline_object(
             "new_vertices": 0,
         }
 
-    normalized_points = _deduplicate_polyline(points)
+    normalized_points = _planarize_polyline(points)
     target_faces = _scope_faces(
         bm,
         uv_layer,
@@ -3434,13 +3768,28 @@ class UV_OT_batch_knife(bpy.types.Operator):
         if (
             self._snap_mode in {"POINTS", "EDGE_CENTERS", "FACE_CENTERS"}
             and self._active_axis is None
-            and self._snap_tree is not None
         ):
-            _coordinate, index, distance = self._snap_tree.find(
-                (constrained[0], constrained[1], 0.0)
-            )
-            if distance <= _POINT_SNAP_RADIUS_PX:
+            best = None
+            if self._snap_tree is not None:
+                _coordinate, index, distance = self._snap_tree.find(
+                    (constrained[0], constrained[1], 0.0)
+                )
                 pixel, uv = self._snap_points[index]
+                best = (float(distance), pixel, uv)
+
+            if (
+                self._snap_mode == "POINTS"
+                and self._knife_mode() == "MULTI"
+            ):
+                path_pixels = getattr(self, "_path_pixel_points", ())
+                path_uvs = getattr(self, "_path_uv_points", ())
+                for pixel, uv in zip(path_pixels[:-1], path_uvs[:-1]):
+                    distance = math.sqrt(_dist_sq(constrained, pixel))
+                    if best is None or distance < best[0]:
+                        best = (distance, pixel, uv)
+
+            if best is not None and best[0] <= _POINT_SNAP_RADIUS_PX:
+                _distance, pixel, uv = best
                 self._point_snap_hit = True
                 self._snap_active = True
                 self._current_snap_uv = uv

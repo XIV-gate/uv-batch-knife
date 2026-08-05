@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="uv_batch_knife_reload_test_") as direct
     )
     try:
         old_version = module._ADDON_VERSION
-        new_version = "1.5.7"
+        new_version = "1.5.8"
         module.register()
         snapshot = module._capture_extension_snapshot(package_root)
         write_new_version(package_root, old_version, new_version)
@@ -113,7 +113,7 @@ with tempfile.TemporaryDirectory(prefix="uv_batch_knife_reload_test_") as direct
         old_version = module._ADDON_VERSION
         module.register()
         snapshot = module._capture_extension_snapshot(package_root)
-        write_new_version(package_root, old_version, "1.5.6")
+        write_new_version(package_root, old_version, "1.5.7")
         callback = module._make_extension_reload_callback(
             module_name,
             "9.9.9",

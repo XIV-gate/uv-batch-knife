@@ -68,6 +68,8 @@ context = SimpleNamespace(
 
 operator = SimpleNamespace(
     target_mode="VISIBLE",
+    cut_mode="LINE",
+    line_mode="MULTI",
     _snap_caches={},
     _snap_tree=None,
     _snap_points=None,
@@ -79,8 +81,11 @@ operator = SimpleNamespace(
     _snap_active=False,
     _point_snap_hit=False,
     _current_snap_uv=None,
+    _path_pixel_points=[],
+    _path_uv_points=[],
 )
 for method_name in (
+    "_knife_mode",
     "_constrained_point",
     "_uv_grid_snap_steps",
     "_snap_mode_label",
@@ -119,6 +124,22 @@ assert cache_results["EDGE_CENTERS"] == [
 ], cache_results
 assert cache_results["FACE_CENTERS"] == [(0.5, 0.5)], cache_results
 
+operator._snap_mode = "POINTS"
+operator._build_snap_cache(context)
+operator._path_uv_points = [(0.25, 0.25), (0.8, 0.8)]
+operator._path_pixel_points = [
+    region.view2d.view_to_region(*uv)
+    for uv in operator._path_uv_points
+]
+own_point_result = operator._update_pointer(
+    context,
+    region.view2d.view_to_region(0.28, 0.27),
+)
+own_point_snapped_uv = tuple(operator._current_snap_uv)
+assert own_point_result == operator._path_pixel_points[0]
+assert own_point_snapped_uv == operator._path_uv_points[0]
+assert operator._point_snap_hit
+
 operator._snap_mode = "UV_GRID"
 grid_steps = operator._uv_grid_snap_steps(context)
 input_pixel = region.view2d.view_to_region(0.137, 0.263)
@@ -145,6 +166,7 @@ summary = {
     },
     "grid_steps": grid_steps,
     "grid_snapped_uv": grid_snapped_uv,
+    "own_point_snapped_uv": own_point_snapped_uv,
     "snap_modes": addon._SNAP_MODES,
 }
 print("UV_SNAP_MODES_TEST_RESULT=" + json.dumps(summary, sort_keys=True))
