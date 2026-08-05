@@ -3,6 +3,7 @@ import json
 import pathlib
 import subprocess
 import tempfile
+import textwrap
 import time
 import tomllib
 import urllib.error
@@ -47,7 +48,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.1"
+_ADDON_VERSION = "1.5.2"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -2589,10 +2590,14 @@ class UV_OT_batch_knife_update(bpy.types.Operator):
     def execute(self, context):
         if not bpy.app.online_access:
             message = (
-                "Online access is disabled in Preferences → System"
+                "Online access is disabled. Enable: Edit → Preferences → "
+                "System → Network → Allow Online Access, then try again."
             )
             if bpy.app.online_access_override:
-                message = "Blender was started with forced offline mode"
+                message = (
+                    "Blender was started in forced offline mode. Restart "
+                    "Blender without --offline-mode, then try again."
+                )
             self._set_status(context, message)
             self.report({"WARNING"}, message)
             return {"CANCELLED"}
@@ -3730,7 +3735,8 @@ class IMAGE_PT_uv_batch_knife(bpy.types.Panel):
         )
         if update_status:
             status_box = column.box()
-            status_box.label(text=update_status)
+            for status_line in textwrap.wrap(update_status, width=46):
+                status_box.label(text=status_line)
         column.separator()
         column.label(text="Author: XIVgate")
         repository = column.operator(

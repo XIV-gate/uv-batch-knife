@@ -111,8 +111,13 @@ try:
     if not bpy.app.online_access:
         update_result = bpy.ops.uv.batch_knife_update()
         assert update_result == {"CANCELLED"}
-        assert "Online access" in (
+        offline_message = (
             bpy.context.window_manager.uv_batch_knife_update_status
+        )
+        assert "Online access is disabled" in offline_message
+        assert (
+            "Edit → Preferences → System → Network → Allow Online Access"
+            in offline_message
         )
 finally:
     addon.unregister()
