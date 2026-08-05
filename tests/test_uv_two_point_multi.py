@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+from types import SimpleNamespace
 
 import bmesh
 import bpy
@@ -10,15 +11,22 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ADDON_PATH = ROOT / "__init__.py"
 
 spec = importlib.util.spec_from_file_location(
-    "uv_finite_knife_test",
+    "uv_two_point_multi_test",
     ADDON_PATH,
 )
 addon = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(addon)
 
+assert addon._KNIFE_MODES == ("MULTI", "INFINITE", "GRID")
+mode_state = SimpleNamespace(cut_mode="LINE", line_mode="MULTI")
+for expected_mode in addon._KNIFE_MODES:
+    addon.UV_OT_batch_knife._set_knife_mode(mode_state, expected_mode)
+    actual_mode = addon.UV_OT_batch_knife._knife_mode(mode_state)
+    assert actual_mode == expected_mode, (expected_mode, actual_mode)
 
-mesh = bpy.data.meshes.new("UVFiniteKnifeTestMesh")
-obj = bpy.data.objects.new("UVFiniteKnifeTest", mesh)
+
+mesh = bpy.data.meshes.new("UVTwoPointMultiTestMesh")
+obj = bpy.data.objects.new("UVTwoPointMultiTest", mesh)
 bpy.context.scene.collection.objects.link(obj)
 mesh.from_pydata(
     (
@@ -68,4 +76,4 @@ assert result["new_vertices"] == 4, summary
 assert len(bm.faces) == 4, summary
 assert summary["seams"] == 2, summary
 
-print("UV_FINITE_KNIFE_TEST_RESULT=" + json.dumps(summary, sort_keys=True))
+print("UV_TWO_POINT_MULTI_TEST_RESULT=" + json.dumps(summary, sort_keys=True))

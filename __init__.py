@@ -36,7 +36,7 @@ _SNAP_MODE_LABELS = {
     "EDGE_CENTERS": "S3 Edge Centers",
     "FACE_CENTERS": "S4 Face Centers",
 }
-_LINE_MODES = ("FINITE", "INFINITE", "MULTI")
+_KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
 
 
 def _cross2(a, b):
@@ -1985,7 +1985,7 @@ def _draw_batch_knife(operator):
         blf.color(0, 1.0, 1.0, 1.0, 1.0)
         blf.draw(
             0,
-            f"{operator._line_mode_label()} | "
+            f"{operator._knife_mode_label()} | "
             f"{operator._snap_mode_label(context)}{point_count}",
         )
     else:
@@ -2036,30 +2036,20 @@ class UV_OT_batch_knife(bpy.types.Operator):
     )
     line_mode: EnumProperty(
         name="Line Mode",
-        description="Choose a finite, infinite, or multi-point cut",
+        description="Choose a multi-point or infinite cut",
         items=(
             (
-                "FINITE",
-                "Point to Point",
-                "Cut only along the segment between two points",
+                "MULTI",
+                "Multi-Point",
+                "Place a polyline of Knife points and confirm with Enter",
             ),
             (
                 "INFINITE",
                 "Infinite Line",
                 "Extend the line infinitely in both directions",
             ),
-            (
-                "MULTI",
-                "Multi-Point",
-                "Place a polyline of Knife points and confirm with Enter",
-            ),
         ),
-        default="FINITE",
-    )
-    extend_line: BoolProperty(
-        name="Extend Line",
-        description="Treat the drawn segment as an infinite line",
-        default=False,
+        default="MULTI",
     )
     split_uv_islands: BoolProperty(
         name="Split UV Islands",
@@ -2268,12 +2258,22 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return f"{label} ({steps[0]:.6g} UV)"
         return f"{label} ({steps[0]:.6g} x {steps[1]:.6g} UV)"
 
-    def _line_mode_label(self):
+    def _knife_mode(self):
+        return "GRID" if self.cut_mode == "GRID" else self.line_mode
+
+    def _set_knife_mode(self, mode):
+        if mode == "GRID":
+            self.cut_mode = "GRID"
+            return
+        self.cut_mode = "LINE"
+        self.line_mode = mode
+
+    def _knife_mode_label(self):
         return {
-            "FINITE": "C1 Point to Point",
+            "MULTI": "C1 Multi-Point",
             "INFINITE": "C2 Infinite Line",
-            "MULTI": "C3 Multi-Point",
-        }.get(self.line_mode, "C1 Point to Point")
+            "GRID": "C3 Grid Knife",
+        }.get(self._knife_mode(), "C1 Multi-Point")
 
     def _build_snap_cache(self, context):
         self._snap_tree = None
@@ -2532,18 +2532,19 @@ class UV_OT_batch_knife(bpy.types.Operator):
             lock_text = " | X: горизонталь зафиксирована"
         elif self._axis_lock == "Y":
             lock_text = " | Y: вертикаль зафиксирована"
-        line_text = self._line_mode_label()
+        knife_mode = self._knife_mode()
+        line_text = self._knife_mode_label()
         multi_text = (
             " Enter — завершить; Backspace — удалить точку;"
-            if self.line_mode == "MULTI"
+            if knife_mode == "MULTI"
             else ""
         )
         context.workspace.status_text_set(
             f"UV Batch Knife: {line_text}; "
             f"S — режим снапа: {snap_text}; "
-            f"C — тип линии;{multi_text} "
+            f"C — режим реза;{multi_text} "
             "Ctrl — ближайшая ось; X/Y — фиксация оси; "
-            "G — режим грида; ПКМ/Esc — отмена"
+            "ПКМ/Esc — отмена"
             + lock_text
         )
 
@@ -2551,8 +2552,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
         self.cut_mode = "LINE"
-        self.line_mode = "FINITE"
-        self.extend_line = False
+        self.line_mode = "MULTI"
         self.grid_subdivisions = 2
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
@@ -2650,40 +2650,26 @@ class UV_OT_batch_knife(bpy.types.Operator):
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
 
-        if (
-            self.cut_mode == "LINE"
-            and event.type == "C"
-            and event.value == "PRESS"
-        ):
-            previous_mode = self.line_mode
-            mode_index = _LINE_MODES.index(self.line_mode)
-            self.line_mode = _LINE_MODES[
-                (mode_index + 1) % len(_LINE_MODES)
+        if event.type == "C" and event.value == "PRESS":
+            previous_mode = self._knife_mode()
+            mode_index = _KNIFE_MODES.index(previous_mode)
+            next_mode = _KNIFE_MODES[
+                (mode_index + 1) % len(_KNIFE_MODES)
             ]
-            self.extend_line = self.line_mode == "INFINITE"
+            self._set_knife_mode(next_mode)
+            self._axis_lock = None
+            self._active_axis = None
+            self._grid_segments_pixel = ()
             if (
                 previous_mode == "MULTI"
-                and self.line_mode != "MULTI"
+                and next_mode != "MULTI"
                 and self._path_pixel_points
             ):
                 self._path_pixel_points = [self._path_pixel_points[0]]
                 self._path_uv_points = [self._path_uv_points[0]]
                 self._pixel_start = self._path_pixel_points[0]
-            self._set_status_text(context)
-            context.area.tag_redraw()
-            return {"RUNNING_MODAL"}
-
-        if event.type == "G" and event.value == "PRESS":
-            self.cut_mode = "GRID" if self.cut_mode == "LINE" else "LINE"
-            self._axis_lock = None
-            self._active_axis = None
-            self._grid_segments_pixel = ()
-            if self._path_pixel_points:
-                self._path_pixel_points = [self._path_pixel_points[0]]
-                self._path_uv_points = [self._path_uv_points[0]]
-                self._pixel_start = self._path_pixel_points[0]
             if self._stage == 1:
-                if self.cut_mode == "GRID":
+                if next_mode == "GRID":
                     self._update_grid_preview(
                         context,
                         self._pixel_raw_end,
