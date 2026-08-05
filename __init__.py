@@ -795,10 +795,7 @@ def _isolate_uv_island_seeds(bm, uv_layer, seeds):
         for face in island
         for edge in face.edges
         if edge.is_valid
-        and any(
-            neighbor.is_valid and neighbor not in island
-            for neighbor in edge.link_faces
-        )
+        and _edge_is_uv_island_boundary(face, edge, uv_layer)
     }
     if not boundary_edges:
         return {

@@ -39,6 +39,50 @@ CONTINUOUS_RIGHT_UVS = (
     (2.0, 1.0),
     (1.0, 1.0),
 )
+CUBE_VERTICES = (
+    (-1.0, -1.0, -1.0),
+    (1.0, -1.0, -1.0),
+    (1.0, 1.0, -1.0),
+    (-1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0),
+    (1.0, -1.0, 1.0),
+    (1.0, 1.0, 1.0),
+    (-1.0, 1.0, 1.0),
+)
+CUBE_FACES = (
+    (0, 3, 2, 1),
+    (0, 1, 5, 4),
+    (1, 2, 6, 5),
+    (2, 3, 7, 6),
+    (3, 0, 4, 7),
+    (4, 5, 6, 7),
+)
+CUBE_NET_UVS = (
+    (1.0, 0.0),
+    (1.0, -1.0),
+    (2.0, -1.0),
+    (2.0, 0.0),
+    (1.0, 0.0),
+    (2.0, 0.0),
+    (2.0, 1.0),
+    (1.0, 1.0),
+    (3.0, 1.0),
+    (3.0, 2.0),
+    (2.0, 2.0),
+    (2.0, 1.0),
+    (2.0, 3.0),
+    (1.0, 3.0),
+    (1.0, 2.0),
+    (2.0, 2.0),
+    (0.0, 2.0),
+    (0.0, 1.0),
+    (1.0, 1.0),
+    (1.0, 2.0),
+    (1.0, 1.0),
+    (2.0, 1.0),
+    (2.0, 2.0),
+    (1.0, 2.0),
+)
 
 
 def _new_adjacent_quads(name, right_uvs, select_right=False):
@@ -64,6 +108,26 @@ def _new_adjacent_quads(name, right_uvs, select_right=False):
     bm.faces[0].select = True
     bm.faces[1].select = select_right
     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    return obj, mesh
+
+
+def _new_cube_net(name):
+    if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    bpy.ops.object.select_all(action="DESELECT")
+
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    mesh.from_pydata(CUBE_VERTICES, (), CUBE_FACES)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for loop_index, uv in enumerate(CUBE_NET_UVS):
+        uv_layer.data[loop_index].uv = uv
+
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
     return obj, mesh
 
 
@@ -231,6 +295,45 @@ continuous_summary = {
 assert continuous_result["isolated_islands"] == 0, continuous_summary
 assert continuous_summary["face_components"] == 1, continuous_summary
 
+
+def _run_cube_net_case(name, isolate):
+    obj, mesh = _new_cube_net(name)
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+    bottom_face = bm.faces[0]
+    uv_layer = bm.loops.layers.uv.active
+    left_face = bm.faces[4]
+    assert len(addon._uv_island_faces(left_face, uv_layer)) == 6
+
+    result = addon._cut_polyline_object(
+        obj,
+        ((-0.2, 1.5), (0.6, 1.5)),
+        target_mode="VISIBLE",
+        split_uv_islands=False,
+        separation=0.0,
+        mark_seams=True,
+        sync_selection=False,
+        endpoint_extension_mode="NEAREST_CORNER",
+        isolate_uv_islands=isolate,
+    )
+    bm = bmesh.from_edit_mesh(mesh)
+    summary = {
+        "operator_result": result,
+        "bottom_face_vertices": len(bottom_face.verts),
+        "face_components": _connected_face_components(bm.faces),
+    }
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return summary
+
+
+cube_normal = _run_cube_net_case("UVCubeNetNormal", False)
+cube_detached = _run_cube_net_case("UVCubeNetDetached", True)
+assert cube_normal["bottom_face_vertices"] == 5, cube_normal
+assert cube_detached["operator_result"]["isolated_islands"] == 1, cube_detached
+assert cube_detached["operator_result"]["isolation_edges"] == 7, cube_detached
+assert cube_detached["bottom_face_vertices"] == 4, cube_detached
+assert cube_detached["face_components"] == 1, cube_detached
+
 print(
     "UV_ISLAND_ISOLATION_TEST_RESULT="
     + json.dumps(
@@ -240,6 +343,8 @@ print(
             "infinite": infinite_summary,
             "grid": grid_summary,
             "continuous": continuous_summary,
+            "cube_normal": cube_normal,
+            "cube_detached": cube_detached,
         },
         sort_keys=True,
     )
