@@ -1,5 +1,13 @@
 import math
+import json
+import pathlib
+import tempfile
 import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 from collections import deque
 
 import bmesh
@@ -12,6 +20,7 @@ from bpy.props import (
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
+    StringProperty,
 )
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
@@ -37,6 +46,15 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
+_ADDON_VERSION = "1.5.0"
+_ADDON_ID = "uv_batch_knife"
+_GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
+_GITHUB_LATEST_RELEASE_API = (
+    f"https://api.github.com/repos/{_GITHUB_REPOSITORY}/releases/latest"
+)
+_UPDATE_USER_AGENT = f"UV-Batch-Knife/{_ADDON_VERSION} Blender-Updater"
+_MAX_UPDATE_METADATA_BYTES = 2 * 1024 * 1024
+_MAX_UPDATE_ARCHIVE_BYTES = 64 * 1024 * 1024
 _ENDPOINT_EXTENSION_ITEMS = (
     (
         "NEAREST_CORNER",
@@ -49,6 +67,279 @@ _ENDPOINT_EXTENSION_ITEMS = (
         "Connect an endpoint inside a UV face to the nearest point on its boundary",
     ),
 )
+
+
+class _UpdateError(RuntimeError):
+    pass
+
+
+class _UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request,
+        file_pointer,
+        code,
+        message,
+        headers,
+        new_url,
+    ):
+        redirected = super().redirect_request(
+            request,
+            file_pointer,
+            code,
+            message,
+            headers,
+            new_url,
+        )
+        if redirected is None:
+            return None
+        old_host = urllib.parse.urlparse(request.full_url).hostname
+        new_host = urllib.parse.urlparse(new_url).hostname
+        if old_host != new_host:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+_UPDATE_URL_OPENER = urllib.request.build_opener(_UpdateRedirectHandler())
+
+
+def _semantic_version(value):
+    text = str(value).strip()
+    if text[:1].lower() == "v":
+        text = text[1:]
+    stable = text.split("+", 1)[0]
+    if "-" in stable:
+        raise _UpdateError(f"Pre-release version is not supported: {value}")
+    parts = stable.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise _UpdateError(f"Invalid release version: {value}")
+    return tuple(int(part) for part in parts)
+
+
+def _normalized_version(value):
+    return ".".join(str(part) for part in _semantic_version(value))
+
+
+def _trusted_update_url(url, *, api=False):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.lower()
+    if api:
+        return hostname == "api.github.com"
+    return (
+        hostname == "github.com"
+        or hostname.endswith(".githubusercontent.com")
+    )
+
+
+def _read_latest_release_metadata(github_token=""):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": _UPDATE_USER_AGENT,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    request = urllib.request.Request(
+        _GITHUB_LATEST_RELEASE_API,
+        headers=headers,
+    )
+    try:
+        with _UPDATE_URL_OPENER.open(request, timeout=20.0) as response:
+            if not _trusted_update_url(response.geturl(), api=True):
+                raise _UpdateError("GitHub API redirected to an untrusted host")
+            payload_bytes = response.read(_MAX_UPDATE_METADATA_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            raise _UpdateError("GitHub rejected the access token") from error
+        if error.code == 404:
+            if github_token:
+                message = (
+                    "Private repository is not accessible with this token"
+                )
+            else:
+                message = (
+                    "Repository is private; enter a read-only GitHub token"
+                )
+            raise _UpdateError(message) from error
+        if error.code == 403:
+            raise _UpdateError(
+                "GitHub rate limit reached; try again later"
+            ) from error
+        raise _UpdateError(
+            f"GitHub returned HTTP {error.code}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise _UpdateError(f"Cannot reach GitHub: {error.reason}") from error
+
+    if len(payload_bytes) > _MAX_UPDATE_METADATA_BYTES:
+        raise _UpdateError("GitHub release metadata is unexpectedly large")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _UpdateError("GitHub returned invalid release metadata") from error
+    if not isinstance(payload, dict):
+        raise _UpdateError("GitHub returned invalid release metadata")
+    return payload
+
+
+def _release_update_info(
+    payload,
+    current_version=_ADDON_VERSION,
+    *,
+    authenticated=False,
+):
+    tag_name = payload.get("tag_name")
+    latest_version = _normalized_version(tag_name)
+    current_tuple = _semantic_version(current_version)
+    latest_tuple = _semantic_version(latest_version)
+    info = {
+        "current_version": _normalized_version(current_version),
+        "latest_version": latest_version,
+        "is_newer": latest_tuple > current_tuple,
+        "asset_name": None,
+        "asset_url": None,
+        "release_url": payload.get("html_url"),
+    }
+    if not info["is_newer"]:
+        return info
+
+    expected_name = f"uv_batch_knife-{latest_version}.zip"
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise _UpdateError("Latest GitHub release has no downloadable assets")
+    asset = next(
+        (
+            candidate
+            for candidate in assets
+            if isinstance(candidate, dict)
+            and candidate.get("name") == expected_name
+        ),
+        None,
+    )
+    if asset is None:
+        raise _UpdateError(
+            f"Latest release does not contain {expected_name}"
+        )
+    asset_url = asset.get("url" if authenticated else "browser_download_url")
+    if not isinstance(asset_url, str) or not _trusted_update_url(
+        asset_url,
+        api=authenticated,
+    ):
+        raise _UpdateError("Latest release contains an untrusted download URL")
+    info["asset_name"] = expected_name
+    info["asset_url"] = asset_url
+    return info
+
+
+def _download_update_archive(asset_url, asset_name, github_token=""):
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": _UPDATE_USER_AGENT,
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    request = urllib.request.Request(
+        asset_url,
+        headers=headers,
+    )
+    archive_path = None
+    try:
+        with _UPDATE_URL_OPENER.open(request, timeout=30.0) as response:
+            if not _trusted_update_url(response.geturl()):
+                raise _UpdateError("Update download redirected to an untrusted host")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    expected_size = int(content_length)
+                except ValueError as error:
+                    raise _UpdateError("Update has an invalid file size") from error
+                if expected_size > _MAX_UPDATE_ARCHIVE_BYTES:
+                    raise _UpdateError("Update archive is unexpectedly large")
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix="uv_batch_knife_update_",
+                suffix=".zip",
+                delete=False,
+            ) as destination:
+                archive_path = pathlib.Path(destination.name)
+                total_size = 0
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > _MAX_UPDATE_ARCHIVE_BYTES:
+                        raise _UpdateError("Update archive is unexpectedly large")
+                    destination.write(chunk)
+    except urllib.error.HTTPError as error:
+        raise _UpdateError(
+            f"Update download returned HTTP {error.code}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise _UpdateError(f"Cannot download update: {error.reason}") from error
+    except Exception:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
+        raise
+
+    if archive_path is None or not archive_path.exists():
+        raise _UpdateError(f"Failed to download {asset_name}")
+    return archive_path
+
+
+def _validate_update_archive(archive_path, expected_version):
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            entries = archive.infolist()
+            if sum(entry.file_size for entry in entries) > _MAX_UPDATE_ARCHIVE_BYTES:
+                raise _UpdateError("Unpacked update archive is unexpectedly large")
+            manifest_entries = [
+                entry
+                for entry in entries
+                if pathlib.PurePosixPath(entry.filename).name
+                == "blender_manifest.toml"
+            ]
+            if len(manifest_entries) != 1:
+                raise _UpdateError(
+                    "Update archive must contain one blender_manifest.toml"
+                )
+            manifest_entry = manifest_entries[0]
+            manifest_parent = pathlib.PurePosixPath(
+                manifest_entry.filename
+            ).parent
+            init_path = str(manifest_parent / "__init__.py")
+            if init_path not in {entry.filename for entry in entries}:
+                raise _UpdateError("Update archive does not contain __init__.py")
+            manifest_bytes = archive.read(manifest_entry)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise _UpdateError("Downloaded update is not a valid ZIP archive") from error
+
+    try:
+        manifest = tomllib.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise _UpdateError("Update contains an invalid Blender manifest") from error
+    if manifest.get("id") != _ADDON_ID:
+        raise _UpdateError("Downloaded package has a different extension ID")
+    manifest_version = _normalized_version(manifest.get("version"))
+    if manifest_version != _normalized_version(expected_version):
+        raise _UpdateError("Downloaded package version does not match the release")
+    return manifest
+
+
+def _current_extension_repository():
+    module_parts = __name__.split(".")
+    if len(module_parts) >= 3 and module_parts[0] == "bl_ext":
+        return module_parts[1]
+    return "user_default"
+
+
+def _addon_preferences(context):
+    module_name = __package__ or __name__
+    addon = context.preferences.addons.get(module_name)
+    return addon.preferences if addon is not None else None
 
 
 def _cross2(a, b):
@@ -2294,6 +2585,117 @@ def _draw_batch_knife(operator):
     gpu.state.blend_set("NONE")
 
 
+class UVBatchKnifePreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__ or __name__
+
+    github_token: StringProperty(
+        name="GitHub Token",
+        description=(
+            "Optional read-only token required only while the GitHub "
+            "repository is private"
+        ),
+        subtype="PASSWORD",
+        default="",
+    )
+
+    def draw(self, context):
+        del context
+        layout = self.layout
+        layout.prop(self, "github_token")
+        layout.label(text="Required only for a private GitHub repository")
+
+
+class UV_OT_batch_knife_update(bpy.types.Operator):
+    bl_idname = "uv.batch_knife_update"
+    bl_label = "Check and Install Update"
+    bl_description = (
+        "Compare this extension with the latest GitHub release and install "
+        "it when a newer version is available"
+    )
+    bl_options = {"INTERNAL"}
+
+    def _set_status(self, context, message):
+        context.window_manager.uv_batch_knife_update_status = message
+
+    def execute(self, context):
+        if not bpy.app.online_access:
+            message = (
+                "Online access is disabled in Preferences → System"
+            )
+            if bpy.app.online_access_override:
+                message = "Blender was started with forced offline mode"
+            self._set_status(context, message)
+            self.report({"WARNING"}, message)
+            return {"CANCELLED"}
+
+        self._set_status(context, "Checking GitHub Releases…")
+        archive_path = None
+        try:
+            preferences = _addon_preferences(context)
+            github_token = (
+                preferences.github_token.strip()
+                if preferences is not None
+                else ""
+            )
+            payload = _read_latest_release_metadata(github_token)
+            update = _release_update_info(
+                payload,
+                authenticated=bool(github_token),
+            )
+            if not update["is_newer"]:
+                message = (
+                    f"Version {_ADDON_VERSION} is already the latest"
+                )
+                self._set_status(context, message)
+                self.report({"INFO"}, message)
+                return {"FINISHED"}
+
+            self._set_status(
+                context,
+                f"Downloading {update['latest_version']}…",
+            )
+            archive_path = _download_update_archive(
+                update["asset_url"],
+                update["asset_name"],
+                github_token,
+            )
+            _validate_update_archive(
+                archive_path,
+                update["latest_version"],
+            )
+
+            install_result = bpy.ops.extensions.package_install_files(
+                "EXEC_DEFAULT",
+                filepath=str(archive_path),
+                repo=_current_extension_repository(),
+                enable_on_install=True,
+                overwrite=True,
+            )
+            if "FINISHED" not in install_result:
+                raise _UpdateError("Blender could not install the update")
+
+            message = (
+                f"Updated to {update['latest_version']}; restart Blender "
+                "if the interface still shows the old version"
+            )
+            self._set_status(context, message)
+            self.report({"INFO"}, message)
+            return {"FINISHED"}
+        except _UpdateError as error:
+            message = str(error)
+            self._set_status(context, message)
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        except RuntimeError as error:
+            message = f"Blender update installation failed: {error}"
+            self._set_status(context, message)
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        finally:
+            if archive_path is not None:
+                archive_path.unlink(missing_ok=True)
+
+
 class UV_OT_batch_knife(bpy.types.Operator):
     bl_idname = "uv.batch_knife"
     bl_label = "UV Batch Knife"
@@ -3368,6 +3770,26 @@ class IMAGE_PT_uv_batch_knife(bpy.types.Panel):
         column.operator(UV_OT_batch_knife.bl_idname, text="Start UV Batch Knife")
         column.label(text="Shortcut: K")
         column.separator()
+        column.label(text=f"Installed Version: {_ADDON_VERSION}")
+        preferences = _addon_preferences(context)
+        if preferences is not None:
+            column.prop(
+                preferences,
+                "github_token",
+                text="GitHub Token",
+            )
+        column.operator(
+            UV_OT_batch_knife_update.bl_idname,
+            text="Check and Install Update",
+            icon="FILE_REFRESH",
+        )
+        update_status = (
+            context.window_manager.uv_batch_knife_update_status
+        )
+        if update_status:
+            status_box = column.box()
+            status_box.label(text=update_status)
+        column.separator()
         column.label(text="Author: XIVgate")
         repository = column.operator(
             "wm.url_open",
@@ -3389,6 +3811,8 @@ def _menu_uv_batch_knife(self, context):
 
 
 _classes = (
+    UVBatchKnifePreferences,
+    UV_OT_batch_knife_update,
     UV_OT_batch_knife,
     IMAGE_PT_uv_batch_knife,
 )
@@ -3396,6 +3820,11 @@ _keymaps = []
 
 
 def register():
+    bpy.types.WindowManager.uv_batch_knife_update_status = StringProperty(
+        name="UV Batch Knife Update Status",
+        options={"SKIP_SAVE"},
+        default="",
+    )
     bpy.types.Scene.uv_batch_knife_endpoint_extension_mode = EnumProperty(
         name="Interior Endpoints",
         description=(
@@ -3443,5 +3872,6 @@ def unregister():
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
+    del bpy.types.WindowManager.uv_batch_knife_update_status
     del bpy.types.Scene.uv_batch_knife_isolate_uv_islands
     del bpy.types.Scene.uv_batch_knife_endpoint_extension_mode
