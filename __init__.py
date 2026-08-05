@@ -2143,12 +2143,16 @@ def _extended_preview_points(start, end):
 def _grid_cursor_label(operator, context):
     mode_label = operator._knife_mode_label()
     snap_label = operator._snap_mode_label(context)
+    detach_label = operator._detach_mode_label()
     divisions = (
         f"{operator.grid_subdivisions} x "
         f"{operator.grid_subdivisions}"
     )
     if operator._grid_preview_size <= _UV_EPS:
-        return f"{mode_label} | {divisions} | {snap_label}"
+        return (
+            f"{mode_label} | {divisions} | {snap_label}"
+            f" | {detach_label}"
+        )
 
     cell_size = operator._grid_preview_size / operator.grid_subdivisions
     angle_degrees = math.degrees(operator._grid_preview_angle)
@@ -2159,7 +2163,7 @@ def _grid_cursor_label(operator, context):
         f" | Cell {cell_size:.4f} UV"
         f" | Angle {angle_degrees:.1f}°"
         + step_text
-        + f" | {snap_label}"
+        + f" | {snap_label} | {detach_label}"
     )
 
 
@@ -2273,13 +2277,20 @@ def _draw_batch_knife(operator):
             if operator.line_mode == "MULTI"
             else ""
         )
+        endpoint_mode = (
+            f" | {operator._endpoint_mode_label()}"
+            if operator.line_mode == "MULTI"
+            else ""
+        )
         blf.position(0, end[0] + 14.0, end[1] + 14.0, 0.0)
         blf.size(0, 14.0)
         blf.color(0, 1.0, 1.0, 1.0, 1.0)
         blf.draw(
             0,
             f"{operator._knife_mode_label()} | "
-            f"{operator._snap_mode_label(context)}{point_count}",
+            f"{operator._snap_mode_label(context)} | "
+            f"{operator._detach_mode_label()}"
+            f"{endpoint_mode}{point_count}",
         )
     gpu.state.line_width_set(1.0)
     gpu.state.point_size_set(1.0)
@@ -2582,6 +2593,16 @@ class UV_OT_batch_knife(bpy.types.Operator):
             "GRID": "C3 Grid Knife",
         }.get(self._knife_mode(), "C1 Multi-Point")
 
+    def _detach_mode_label(self):
+        return "N1 DETACH" if self.isolate_uv_islands else "N0 NORMAL"
+
+    def _endpoint_mode_label(self):
+        return (
+            "E1 CORNER"
+            if self.endpoint_extension_mode == "NEAREST_CORNER"
+            else "E2 EDGE"
+        )
+
     def _build_snap_cache(self, context):
         self._snap_tree = None
         self._snap_points = []
@@ -2824,12 +2845,14 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
     def _set_status_text(self, context):
         snap_text = self._snap_mode_label(context)
+        detach_text = self._detach_mode_label()
         if self.cut_mode == "GRID":
             context.workspace.status_text_set(
                 f"UV Grid Knife: {self.grid_subdivisions} x "
                 f"{self.grid_subdivisions}; колесо — подразделения; "
                 f"Ctrl — угол 15°; Alt — шаг размера 0.1 UV; "
                 f"S — режим снапа: {snap_text}; "
+                f"N — отделение острова: {detach_text}; "
                 f"C — режим реза; ПКМ/Esc — отмена"
             )
             return
@@ -2842,6 +2865,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
         knife_mode = self._knife_mode()
         line_text = self._knife_mode_label()
         multi_text = (
+            f" E — внутренний конец: {self._endpoint_mode_label()};"
             " Enter — завершить; Backspace — удалить точку;"
             if knife_mode == "MULTI"
             else ""
@@ -2849,6 +2873,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
         context.workspace.status_text_set(
             f"UV Batch Knife: {line_text}; "
             f"S — режим снапа: {snap_text}; "
+            f"N — отделение острова: {detach_text}; "
             f"C — режим реза;{multi_text} "
             "Ctrl — ближайшая ось; X/Y — фиксация оси; "
             "ПКМ/Esc — отмена"
@@ -2959,6 +2984,28 @@ class UV_OT_batch_knife(bpy.types.Operator):
                     self._pixel_raw_end,
                     nearest_axis=False,
                 )
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "N" and event.value == "PRESS":
+            self.isolate_uv_islands = not self.isolate_uv_islands
+            context.scene.uv_batch_knife_isolate_uv_islands = (
+                self.isolate_uv_islands
+            )
+            self._set_status_text(context)
+            context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "E" and event.value == "PRESS":
+            self.endpoint_extension_mode = (
+                "NEAREST_EDGE"
+                if self.endpoint_extension_mode == "NEAREST_CORNER"
+                else "NEAREST_CORNER"
+            )
+            context.scene.uv_batch_knife_endpoint_extension_mode = (
+                self.endpoint_extension_mode
+            )
             self._set_status_text(context)
             context.area.tag_redraw()
             return {"RUNNING_MODAL"}
@@ -3317,25 +3364,26 @@ class IMAGE_PT_uv_batch_knife(bpy.types.Panel):
         return (
             area is not None
             and area.ui_type == "UV"
-            and context.mode == "EDIT_MESH"
         )
 
     def draw(self, context):
         column = self.layout.column(align=True)
-        column.prop(
-            context.scene,
-            "uv_batch_knife_endpoint_extension_mode",
-            text="Interior Endpoints",
-        )
-        column.prop(
-            context.scene,
-            "uv_batch_knife_isolate_uv_islands",
-            text="Detach Cut UV Islands",
-            toggle=True,
-        )
-        column.separator()
         column.operator(UV_OT_batch_knife.bl_idname, text="Start UV Batch Knife")
         column.label(text="Shortcut: K")
+        column.separator()
+        column.label(text="Author: XIVgate")
+        repository = column.operator(
+            "wm.url_open",
+            text="GitHub Repository",
+        )
+        repository.url = "https://github.com/XIV-gate/uv-batch-knife"
+        instructions = column.operator(
+            "wm.url_open",
+            text="Instructions",
+        )
+        instructions.url = (
+            "https://github.com/XIV-gate/uv-batch-knife#readme"
+        )
 
 
 def _menu_uv_batch_knife(self, context):

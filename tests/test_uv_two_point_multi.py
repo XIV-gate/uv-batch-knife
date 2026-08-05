@@ -31,11 +31,67 @@ grid_label_state = SimpleNamespace(
     _grid_step_active=False,
     _knife_mode_label=lambda: "C3 Grid Knife",
     _snap_mode_label=lambda _context: "S0 OFF",
+    _detach_mode_label=lambda: "N0 NORMAL",
 )
 assert (
     addon._grid_cursor_label(grid_label_state, None)
-    == "C3 Grid Knife | 2 x 2 | S0 OFF"
+    == "C3 Grid Knife | 2 x 2 | S0 OFF | N0 NORMAL"
 )
+
+detach_state = SimpleNamespace(isolate_uv_islands=False)
+assert (
+    addon.UV_OT_batch_knife._detach_mode_label(detach_state)
+    == "N0 NORMAL"
+)
+detach_state.isolate_uv_islands = True
+assert (
+    addon.UV_OT_batch_knife._detach_mode_label(detach_state)
+    == "N1 DETACH"
+)
+
+endpoint_state = SimpleNamespace(endpoint_extension_mode="NEAREST_CORNER")
+assert (
+    addon.UV_OT_batch_knife._endpoint_mode_label(endpoint_state)
+    == "E1 CORNER"
+)
+endpoint_state.endpoint_extension_mode = "NEAREST_EDGE"
+assert (
+    addon.UV_OT_batch_knife._endpoint_mode_label(endpoint_state)
+    == "E2 EDGE"
+)
+
+modal_area = SimpleNamespace(
+    as_pointer=lambda: 101,
+    tag_redraw=lambda: None,
+)
+modal_scene = SimpleNamespace(
+    uv_batch_knife_isolate_uv_islands=False,
+    uv_batch_knife_endpoint_extension_mode="NEAREST_CORNER",
+)
+modal_context = SimpleNamespace(area=modal_area, scene=modal_scene)
+modal_state = SimpleNamespace(
+    _area_pointer=101,
+    isolate_uv_islands=False,
+    endpoint_extension_mode="NEAREST_CORNER",
+    _set_status_text=lambda _context: None,
+)
+modal_result = addon.UV_OT_batch_knife.modal(
+    modal_state,
+    modal_context,
+    SimpleNamespace(type="N", value="PRESS"),
+)
+assert modal_result == {"RUNNING_MODAL"}
+assert modal_state.isolate_uv_islands
+assert modal_scene.uv_batch_knife_isolate_uv_islands
+
+modal_result = addon.UV_OT_batch_knife.modal(
+    modal_state,
+    modal_context,
+    SimpleNamespace(type="E", value="PRESS"),
+)
+assert modal_result == {"RUNNING_MODAL"}
+assert modal_state.endpoint_extension_mode == "NEAREST_EDGE"
+assert modal_scene.uv_batch_knife_endpoint_extension_mode == "NEAREST_EDGE"
 
 addon.register()
 try:
