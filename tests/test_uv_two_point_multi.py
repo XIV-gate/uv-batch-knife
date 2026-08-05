@@ -24,6 +24,19 @@ for expected_mode in addon._KNIFE_MODES:
     actual_mode = addon.UV_OT_batch_knife._knife_mode(mode_state)
     assert actual_mode == expected_mode, (expected_mode, actual_mode)
 
+grid_label_state = SimpleNamespace(
+    grid_subdivisions=2,
+    _grid_preview_size=0.0,
+    _grid_preview_angle=0.0,
+    _grid_step_active=False,
+    _knife_mode_label=lambda: "C3 Grid Knife",
+    _snap_mode_label=lambda _context: "S0 OFF",
+)
+assert (
+    addon._grid_cursor_label(grid_label_state, None)
+    == "C3 Grid Knife | 2 x 2 | S0 OFF"
+)
+
 addon.register()
 try:
     operator_rna = bpy.ops.uv.batch_knife.get_rna_type()
@@ -33,10 +46,12 @@ try:
     )
     assert endpoint_modes == ("NEAREST_CORNER", "NEAREST_EDGE"), endpoint_modes
     assert endpoint_property.default == "NEAREST_CORNER"
+    assert not operator_rna.properties["isolate_uv_islands"].default
     assert (
         bpy.context.scene.uv_batch_knife_endpoint_extension_mode
         == "NEAREST_CORNER"
     )
+    assert not bpy.context.scene.uv_batch_knife_isolate_uv_islands
 finally:
     addon.unregister()
 
