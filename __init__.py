@@ -52,7 +52,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.5"
+_ADDON_VERSION = "1.5.6"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -76,6 +76,24 @@ _ENDPOINT_EXTENSION_ITEMS = (
         "NEAREST_EDGE",
         "Nearest Point on Edge",
         "Connect an endpoint inside a UV face to the nearest point on its boundary",
+    ),
+)
+_DETACH_MODES = ("OFF", "ISLANDS", "POLYGONS")
+_DETACH_MODE_ITEMS = (
+    (
+        "OFF",
+        "N0 Off",
+        "Keep the original mesh connectivity outside the cut",
+    ),
+    (
+        "ISLANDS",
+        "N1 UV Islands",
+        "Detach each touched UV island along its UV perimeter",
+    ),
+    (
+        "POLYGONS",
+        "N2 Polygons",
+        "Detach every touched source polygon from all neighboring polygons",
     ),
 )
 
@@ -952,6 +970,7 @@ def _cut_object(
     mark_seams,
     sync_selection,
     isolate_uv_islands=False,
+    detach_mode=None,
 ):
     mesh = obj.data
     bm = bmesh.from_edit_mesh(mesh)
@@ -1007,14 +1026,30 @@ def _cut_object(
         return buckets, records
 
     edge_cut_buckets, face_records = collect_records()
-    isolation = {"islands": 0, "edges": 0, "new_vertices": 0}
-    if isolate_uv_islands:
+    isolation = {
+        "islands": 0,
+        "polygons": 0,
+        "edges": 0,
+        "new_vertices": 0,
+    }
+    detach_mode = _resolved_detach_mode(
+        detach_mode,
+        isolate_uv_islands,
+    )
+    if detach_mode == "ISLANDS":
         isolation = _isolate_cut_bucket_uv_islands(
             bm,
             uv_layer,
             edge_cut_buckets,
         )
         if isolation["islands"]:
+            edge_cut_buckets, face_records = collect_records()
+    elif detach_mode == "POLYGONS":
+        isolation = _isolate_polygon_faces(
+            bm,
+            {record["face"] for record in face_records},
+        )
+        if isolation["polygons"]:
             edge_cut_buckets, face_records = collect_records()
 
     all_target_faces = set(target_faces)
@@ -1050,6 +1085,7 @@ def _cut_object(
         "cut_edges": len(cut_edges),
         "new_vertices": new_vertices,
         "isolated_islands": isolation["islands"],
+        "isolated_polygons": isolation["polygons"],
         "isolation_edges": isolation["edges"],
     }
 
@@ -1264,6 +1300,7 @@ def _isolate_uv_island_seeds(bm, uv_layer, seeds):
     if not boundary_edges:
         return {
             "islands": 0,
+            "polygons": 0,
             "edges": 0,
             "new_vertices": 0,
         }
@@ -1276,9 +1313,50 @@ def _isolate_uv_island_seeds(bm, uv_layer, seeds):
     )
     return {
         "islands": len(islands),
+        "polygons": 0,
         "edges": len(boundary_edges),
         "new_vertices": max(0, len(bm.verts) - vertex_count),
     }
+
+
+def _isolate_polygon_faces(bm, faces):
+    polygons = {
+        face
+        for face in faces
+        if face.is_valid and len(face.loops) >= 3
+    }
+    shared_edges = {
+        edge
+        for face in polygons
+        for edge in face.edges
+        if edge.is_valid and len(edge.link_faces) > 1
+    }
+    if not shared_edges:
+        return {
+            "islands": 0,
+            "polygons": 0,
+            "edges": 0,
+            "new_vertices": 0,
+        }
+
+    vertex_count = len(bm.verts)
+    bmesh.ops.split_edges(
+        bm,
+        edges=list(shared_edges),
+        use_verts=False,
+    )
+    return {
+        "islands": 0,
+        "polygons": len(polygons),
+        "edges": len(shared_edges),
+        "new_vertices": max(0, len(bm.verts) - vertex_count),
+    }
+
+
+def _resolved_detach_mode(detach_mode, isolate_uv_islands):
+    if detach_mode in _DETACH_MODES:
+        return detach_mode
+    return "ISLANDS" if isolate_uv_islands else "OFF"
 
 
 def _isolate_cut_bucket_uv_islands(bm, uv_layer, edge_cut_buckets):
@@ -2087,6 +2165,7 @@ def _cut_polyline_object(
     sync_selection,
     endpoint_extension_mode="NEAREST_CORNER",
     isolate_uv_islands=False,
+    detach_mode=None,
 ):
     mesh = obj.data
     bm = bmesh.from_edit_mesh(mesh)
@@ -2143,14 +2222,30 @@ def _cut_polyline_object(
         return buckets, records
 
     edge_cut_buckets, face_records = collect_records()
-    isolation = {"islands": 0, "edges": 0, "new_vertices": 0}
-    if isolate_uv_islands:
+    isolation = {
+        "islands": 0,
+        "polygons": 0,
+        "edges": 0,
+        "new_vertices": 0,
+    }
+    detach_mode = _resolved_detach_mode(
+        detach_mode,
+        isolate_uv_islands,
+    )
+    if detach_mode == "ISLANDS":
         isolation = _isolate_cut_bucket_uv_islands(
             bm,
             uv_layer,
             edge_cut_buckets,
         )
         if isolation["islands"]:
+            edge_cut_buckets, face_records = collect_records()
+    elif detach_mode == "POLYGONS":
+        isolation = _isolate_polygon_faces(
+            bm,
+            {record["face"] for record in face_records},
+        )
+        if isolation["polygons"]:
             edge_cut_buckets, face_records = collect_records()
 
     all_target_faces = set(target_faces)
@@ -2211,6 +2306,7 @@ def _cut_polyline_object(
         "cut_edges": len({edge for edge in cut_edges if edge.is_valid}),
         "new_vertices": new_vertices,
         "isolated_islands": isolation["islands"],
+        "isolated_polygons": isolation["polygons"],
         "isolation_edges": isolation["edges"],
     }
 
@@ -2228,6 +2324,19 @@ def _edge_uv_pair(edge, uv_layer):
     return None
 
 
+def _face_intersects_uv_segments(face, uv_layer, segments):
+    if not face.is_valid or len(face.loops) < 3:
+        return False
+    polygon = [
+        (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
+        for loop in face.loops
+    ]
+    return any(
+        _segment_inside_polygon_intervals(start, end, polygon)
+        for start, end in segments
+    )
+
+
 def _cut_grid_object(
     obj,
     center,
@@ -2241,6 +2350,7 @@ def _cut_grid_object(
     mark_seams,
     sync_selection,
     isolate_uv_islands=False,
+    detach_mode=None,
 ):
     mesh = obj.data
     bm = bmesh.from_edit_mesh(mesh)
@@ -2280,8 +2390,17 @@ def _cut_grid_object(
         sync_selection,
     )
     initial_target_count = len(target_faces)
-    isolation = {"islands": 0, "edges": 0, "new_vertices": 0}
-    if isolate_uv_islands:
+    isolation = {
+        "islands": 0,
+        "polygons": 0,
+        "edges": 0,
+        "new_vertices": 0,
+    }
+    detach_mode = _resolved_detach_mode(
+        detach_mode,
+        isolate_uv_islands,
+    )
+    if detach_mode == "ISLANDS":
         overlapping_faces = {
             face
             for face in target_faces
@@ -2306,6 +2425,25 @@ def _cut_grid_object(
             bm,
             uv_layer,
             seeds,
+        )
+    elif detach_mode == "POLYGONS":
+        grid_segments = _grid_uv_segments(
+            center,
+            size,
+            angle,
+            subdivisions,
+        )
+        isolation = _isolate_polygon_faces(
+            bm,
+            {
+                face
+                for face in target_faces
+                if _face_intersects_uv_segments(
+                    face,
+                    uv_layer,
+                    grid_segments,
+                )
+            },
         )
 
     current_faces = {
@@ -2558,6 +2696,7 @@ def _cut_grid_object(
         "cut_edges": cut_edge_count,
         "new_vertices": total_new_vertices,
         "isolated_islands": isolation["islands"],
+        "isolated_polygons": isolation["polygons"],
         "isolation_edges": isolation["edges"],
     }
 
@@ -2901,12 +3040,18 @@ class UV_OT_batch_knife(bpy.types.Operator):
         default="NEAREST_CORNER",
     )
     isolate_uv_islands: BoolProperty(
-        name="Detach Cut UV Islands",
+        name="Legacy Detach UV Islands",
         description=(
-            "Detach a whole UV island from adjacent mesh topology when the "
-            "cut inserts a point on that island's UV perimeter"
+            "Compatibility switch for files made before detach modes"
         ),
         default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    detach_mode: EnumProperty(
+        name="Detach Mode",
+        description="Choose which source topology is detached before cutting",
+        items=_DETACH_MODE_ITEMS,
+        default="OFF",
     )
     split_uv_islands: BoolProperty(
         name="Split UV Islands",
@@ -3019,7 +3164,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
             if self.line_mode == "MULTI":
                 layout.prop(self, "endpoint_extension_mode")
         layout.separator()
-        layout.prop(self, "isolate_uv_islands")
+        layout.prop(self, "detach_mode")
         layout.prop(self, "split_uv_islands")
         sub = layout.column()
         sub.enabled = self.split_uv_islands
@@ -3144,7 +3289,11 @@ class UV_OT_batch_knife(bpy.types.Operator):
         }.get(self._knife_mode(), "C1 Multi-Point")
 
     def _detach_mode_label(self):
-        return "N1 DETACH" if self.isolate_uv_islands else "N0 NORMAL"
+        return {
+            "OFF": "N0 OFF",
+            "ISLANDS": "N1 ISLANDS",
+            "POLYGONS": "N2 POLYGONS",
+        }.get(self.detach_mode, "N0 OFF")
 
     def _endpoint_mode_label(self):
         return (
@@ -3439,9 +3588,13 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self.endpoint_extension_mode = (
             context.scene.uv_batch_knife_endpoint_extension_mode
         )
-        self.isolate_uv_islands = (
-            context.scene.uv_batch_knife_isolate_uv_islands
-        )
+        self.detach_mode = context.scene.uv_batch_knife_detach_mode
+        if (
+            self.detach_mode == "OFF"
+            and context.scene.uv_batch_knife_isolate_uv_islands
+        ):
+            self.detach_mode = "ISLANDS"
+        self.isolate_uv_islands = self.detach_mode == "ISLANDS"
         self.grid_subdivisions = 2
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
@@ -3542,7 +3695,12 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         if event.type == "N" and event.value == "PRESS":
-            self.isolate_uv_islands = not self.isolate_uv_islands
+            detach_index = _DETACH_MODES.index(self.detach_mode)
+            self.detach_mode = _DETACH_MODES[
+                (detach_index + 1) % len(_DETACH_MODES)
+            ]
+            context.scene.uv_batch_knife_detach_mode = self.detach_mode
+            self.isolate_uv_islands = self.detach_mode == "ISLANDS"
             context.scene.uv_batch_knife_isolate_uv_islands = (
                 self.isolate_uv_islands
             )
@@ -3806,6 +3964,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
                         mark_seams=self.mark_seams,
                         sync_selection=sync_selection,
                         isolate_uv_islands=self.isolate_uv_islands,
+                        detach_mode=self.detach_mode,
                     )
                 )
         else:
@@ -3841,6 +4000,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
                             mark_seams=self.mark_seams,
                             sync_selection=sync_selection,
                             isolate_uv_islands=self.isolate_uv_islands,
+                            detach_mode=self.detach_mode,
                         )
                     )
                 else:
@@ -3855,6 +4015,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
                             sync_selection=sync_selection,
                             endpoint_extension_mode=self.endpoint_extension_mode,
                             isolate_uv_islands=self.isolate_uv_islands,
+                            detach_mode=self.detach_mode,
                         )
                     )
 
@@ -3864,6 +4025,10 @@ class UV_OT_batch_knife(bpy.types.Operator):
         target_faces = sum(item["target_faces"] for item in results)
         isolated_islands = sum(
             item.get("isolated_islands", 0)
+            for item in results
+        )
+        isolated_polygons = sum(
+            item.get("isolated_polygons", 0)
             for item in results
         )
         elapsed = time.perf_counter() - started
@@ -3896,6 +4061,11 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 + (
                     f", отделено UV-островов {isolated_islands}"
                     if isolated_islands
+                    else ""
+                )
+                + (
+                    f", отделено полигонов {isolated_polygons}"
+                    if isolated_polygons
                     else ""
                 )
                 + f"; {elapsed:.2f} с"
@@ -3990,6 +4160,12 @@ def register():
         ),
         default=False,
     )
+    bpy.types.Scene.uv_batch_knife_detach_mode = EnumProperty(
+        name="Detach Mode",
+        description="Choose which source topology is detached before cutting",
+        items=_DETACH_MODE_ITEMS,
+        default="OFF",
+    )
     for cls in _classes:
         bpy.utils.register_class(cls)
 
@@ -4021,5 +4197,6 @@ def unregister():
         bpy.utils.unregister_class(cls)
 
     del bpy.types.WindowManager.uv_batch_knife_update_status
+    del bpy.types.Scene.uv_batch_knife_detach_mode
     del bpy.types.Scene.uv_batch_knife_isolate_uv_islands
     del bpy.types.Scene.uv_batch_knife_endpoint_extension_mode

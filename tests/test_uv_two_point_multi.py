@@ -31,22 +31,27 @@ grid_label_state = SimpleNamespace(
     _grid_step_active=False,
     _knife_mode_label=lambda: "C3 Grid Knife",
     _snap_mode_label=lambda _context: "S0 OFF",
-    _detach_mode_label=lambda: "N0 NORMAL",
+    _detach_mode_label=lambda: "N0 OFF",
 )
 assert (
     addon._grid_cursor_label(grid_label_state, None)
-    == "C3 Grid Knife | 2 x 2 | S0 OFF | N0 NORMAL"
+    == "C3 Grid Knife | 2 x 2 | S0 OFF | N0 OFF"
 )
 
-detach_state = SimpleNamespace(isolate_uv_islands=False)
+detach_state = SimpleNamespace(detach_mode="OFF")
 assert (
     addon.UV_OT_batch_knife._detach_mode_label(detach_state)
-    == "N0 NORMAL"
+    == "N0 OFF"
 )
-detach_state.isolate_uv_islands = True
+detach_state.detach_mode = "ISLANDS"
 assert (
     addon.UV_OT_batch_knife._detach_mode_label(detach_state)
-    == "N1 DETACH"
+    == "N1 ISLANDS"
+)
+detach_state.detach_mode = "POLYGONS"
+assert (
+    addon.UV_OT_batch_knife._detach_mode_label(detach_state)
+    == "N2 POLYGONS"
 )
 
 endpoint_state = SimpleNamespace(endpoint_extension_mode="NEAREST_CORNER")
@@ -66,12 +71,14 @@ modal_area = SimpleNamespace(
 )
 modal_scene = SimpleNamespace(
     uv_batch_knife_isolate_uv_islands=False,
+    uv_batch_knife_detach_mode="OFF",
     uv_batch_knife_endpoint_extension_mode="NEAREST_CORNER",
 )
 modal_context = SimpleNamespace(area=modal_area, scene=modal_scene)
 modal_state = SimpleNamespace(
     _area_pointer=101,
     isolate_uv_islands=False,
+    detach_mode="OFF",
     endpoint_extension_mode="NEAREST_CORNER",
     _set_status_text=lambda _context: None,
 )
@@ -83,6 +90,28 @@ modal_result = addon.UV_OT_batch_knife.modal(
 assert modal_result == {"RUNNING_MODAL"}
 assert modal_state.isolate_uv_islands
 assert modal_scene.uv_batch_knife_isolate_uv_islands
+assert modal_state.detach_mode == "ISLANDS"
+assert modal_scene.uv_batch_knife_detach_mode == "ISLANDS"
+
+modal_result = addon.UV_OT_batch_knife.modal(
+    modal_state,
+    modal_context,
+    SimpleNamespace(type="N", value="PRESS"),
+)
+assert modal_result == {"RUNNING_MODAL"}
+assert not modal_state.isolate_uv_islands
+assert not modal_scene.uv_batch_knife_isolate_uv_islands
+assert modal_state.detach_mode == "POLYGONS"
+assert modal_scene.uv_batch_knife_detach_mode == "POLYGONS"
+
+modal_result = addon.UV_OT_batch_knife.modal(
+    modal_state,
+    modal_context,
+    SimpleNamespace(type="N", value="PRESS"),
+)
+assert modal_result == {"RUNNING_MODAL"}
+assert modal_state.detach_mode == "OFF"
+assert modal_scene.uv_batch_knife_detach_mode == "OFF"
 
 modal_result = addon.UV_OT_batch_knife.modal(
     modal_state,
@@ -103,11 +132,17 @@ try:
     assert endpoint_modes == ("NEAREST_CORNER", "NEAREST_EDGE"), endpoint_modes
     assert endpoint_property.default == "NEAREST_CORNER"
     assert not operator_rna.properties["isolate_uv_islands"].default
+    detach_property = operator_rna.properties["detach_mode"]
+    assert tuple(
+        item.identifier for item in detach_property.enum_items
+    ) == ("OFF", "ISLANDS", "POLYGONS")
+    assert detach_property.default == "OFF"
     assert (
         bpy.context.scene.uv_batch_knife_endpoint_extension_mode
         == "NEAREST_CORNER"
     )
     assert not bpy.context.scene.uv_batch_knife_isolate_uv_islands
+    assert bpy.context.scene.uv_batch_knife_detach_mode == "OFF"
 finally:
     addon.unregister()
 

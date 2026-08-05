@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "uv_batch_knife"
-version = "1.5.5"
+version = "1.5.6"
 name = "UV Batch Knife"
 tagline = "Cut overlapping UV islands with one UV-space line"
 maintainer = "XIVgate"
