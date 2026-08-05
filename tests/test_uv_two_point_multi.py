@@ -24,6 +24,22 @@ for expected_mode in addon._KNIFE_MODES:
     actual_mode = addon.UV_OT_batch_knife._knife_mode(mode_state)
     assert actual_mode == expected_mode, (expected_mode, actual_mode)
 
+addon.register()
+try:
+    operator_rna = bpy.ops.uv.batch_knife.get_rna_type()
+    endpoint_property = operator_rna.properties["endpoint_extension_mode"]
+    endpoint_modes = tuple(
+        item.identifier for item in endpoint_property.enum_items
+    )
+    assert endpoint_modes == ("NEAREST_CORNER", "NEAREST_EDGE"), endpoint_modes
+    assert endpoint_property.default == "NEAREST_CORNER"
+    assert (
+        bpy.context.scene.uv_batch_knife_endpoint_extension_mode
+        == "NEAREST_CORNER"
+    )
+finally:
+    addon.unregister()
+
 
 mesh = bpy.data.meshes.new("UVTwoPointMultiTestMesh")
 obj = bpy.data.objects.new("UVTwoPointMultiTest", mesh)

@@ -37,6 +37,18 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
+_ENDPOINT_EXTENSION_ITEMS = (
+    (
+        "NEAREST_CORNER",
+        "Nearest Corner",
+        "Connect an endpoint inside a UV face to its nearest visible corner",
+    ),
+    (
+        "NEAREST_EDGE",
+        "Nearest Point on Edge",
+        "Connect an endpoint inside a UV face to the nearest point on its boundary",
+    ),
+)
 
 
 def _cross2(a, b):
@@ -891,6 +903,52 @@ def _segment_inside_polygon_intervals(start, end, polygon):
     return intervals
 
 
+def _nearest_visible_polygon_corner(point, polygon):
+    candidates = sorted(
+        enumerate(polygon),
+        key=lambda item: (
+            _dist_sq(point, item[1]),
+            item[1][0],
+            item[1][1],
+            item[0],
+        ),
+    )
+    tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
+    for _index, corner in candidates:
+        intervals = _segment_inside_polygon_intervals(
+            point,
+            corner,
+            polygon,
+        )
+        if len(intervals) != 1:
+            continue
+        interval_start, interval_end = intervals[0]
+        if (
+            _dist_sq(interval_start, point) <= tolerance_sq
+            and _dist_sq(interval_end, corner) <= tolerance_sq
+        ):
+            return corner
+    return candidates[0][1] if candidates else None
+
+
+def _interior_endpoint_boundary_point(
+    face,
+    uv_layer,
+    point,
+    polygon,
+    endpoint_extension_mode,
+):
+    if endpoint_extension_mode == "NEAREST_CORNER":
+        return _nearest_visible_polygon_corner(point, polygon)
+    nearest = _face_boundary_descriptor(
+        face,
+        uv_layer,
+        point,
+        nearest=True,
+    )
+    return nearest["point"] if nearest is not None else None
+
+
 def _deduplicate_polyline(points):
     result = []
     tolerance_sq = _FACTOR_EPS * _FACTOR_EPS
@@ -902,7 +960,12 @@ def _deduplicate_polyline(points):
     return result
 
 
-def _polyline_face_point_chains(face, uv_layer, points):
+def _polyline_face_point_chains(
+    face,
+    uv_layer,
+    points,
+    endpoint_extension_mode,
+):
     polygon = [
         (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
         for loop in face.loops
@@ -917,14 +980,15 @@ def _polyline_face_point_chains(face, uv_layer, points):
         working[0],
     )
     if _point_in_polygon(working[0], polygon) and start_boundary is None:
-        nearest = _face_boundary_descriptor(
+        boundary_point = _interior_endpoint_boundary_point(
             face,
             uv_layer,
             working[0],
-            nearest=True,
+            polygon,
+            endpoint_extension_mode,
         )
-        if nearest is not None:
-            working.insert(0, nearest["point"])
+        if boundary_point is not None:
+            working.insert(0, boundary_point)
 
     end_boundary = _face_boundary_descriptor(
         face,
@@ -932,14 +996,15 @@ def _polyline_face_point_chains(face, uv_layer, points):
         working[-1],
     )
     if _point_in_polygon(working[-1], polygon) and end_boundary is None:
-        nearest = _face_boundary_descriptor(
+        boundary_point = _interior_endpoint_boundary_point(
             face,
             uv_layer,
             working[-1],
-            nearest=True,
+            polygon,
+            endpoint_extension_mode,
         )
-        if nearest is not None:
-            working.append(nearest["point"])
+        if boundary_point is not None:
+            working.append(boundary_point)
 
     raw_chains = []
     current = []
@@ -1098,11 +1163,13 @@ def _collect_polyline_face_cut(
     uv_layer,
     points,
     edge_cut_buckets,
+    endpoint_extension_mode,
 ):
     point_chains = _polyline_face_point_chains(
         face,
         uv_layer,
         points,
+        endpoint_extension_mode,
     )
     chains = []
     for point_chain in point_chains:
@@ -1389,6 +1456,7 @@ def _cut_polyline_object(
     separation,
     mark_seams,
     sync_selection,
+    endpoint_extension_mode="NEAREST_CORNER",
 ):
     mesh = obj.data
     bm = bmesh.from_edit_mesh(mesh)
@@ -1438,6 +1506,7 @@ def _cut_polyline_object(
             uv_layer,
             normalized_points,
             edge_cut_buckets,
+            endpoint_extension_mode,
         )
         if record is not None:
             face_records.append(record)
@@ -2051,6 +2120,15 @@ class UV_OT_batch_knife(bpy.types.Operator):
         ),
         default="MULTI",
     )
+    endpoint_extension_mode: EnumProperty(
+        name="Interior Endpoints",
+        description=(
+            "Choose how cuts starting or ending inside a UV face reach "
+            "its boundary"
+        ),
+        items=_ENDPOINT_EXTENSION_ITEMS,
+        default="NEAREST_CORNER",
+    )
     split_uv_islands: BoolProperty(
         name="Split UV Islands",
         description=(
@@ -2158,6 +2236,8 @@ class UV_OT_batch_knife(bpy.types.Operator):
             layout.prop(self, "grid_subdivisions")
         else:
             layout.prop(self, "line_mode")
+            if self.line_mode == "MULTI":
+                layout.prop(self, "endpoint_extension_mode")
         layout.separator()
         layout.prop(self, "split_uv_islands")
         sub = layout.column()
@@ -2553,6 +2633,9 @@ class UV_OT_batch_knife(bpy.types.Operator):
         self._area_pointer = context.area.as_pointer()
         self.cut_mode = "LINE"
         self.line_mode = "MULTI"
+        self.endpoint_extension_mode = (
+            context.scene.uv_batch_knife_endpoint_extension_mode
+        )
         self.grid_subdivisions = 2
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
@@ -2938,6 +3021,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
                             separation=self.separation,
                             mark_seams=self.mark_seams,
                             sync_selection=sync_selection,
+                            endpoint_extension_mode=self.endpoint_extension_mode,
                         )
                     )
 
@@ -2995,6 +3079,12 @@ class IMAGE_PT_uv_batch_knife(bpy.types.Panel):
 
     def draw(self, context):
         column = self.layout.column(align=True)
+        column.prop(
+            context.scene,
+            "uv_batch_knife_endpoint_extension_mode",
+            text="Interior Endpoints",
+        )
+        column.separator()
         column.operator(UV_OT_batch_knife.bl_idname, text="Start UV Batch Knife")
         column.label(text="Shortcut: K")
 
@@ -3012,6 +3102,15 @@ _keymaps = []
 
 
 def register():
+    bpy.types.Scene.uv_batch_knife_endpoint_extension_mode = EnumProperty(
+        name="Interior Endpoints",
+        description=(
+            "Choose how cuts starting or ending inside a UV face reach "
+            "its boundary"
+        ),
+        items=_ENDPOINT_EXTENSION_ITEMS,
+        default="NEAREST_CORNER",
+    )
     for cls in _classes:
         bpy.utils.register_class(cls)
 
@@ -3041,3 +3140,5 @@ def unregister():
 
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
+
+    del bpy.types.Scene.uv_batch_knife_endpoint_extension_mode
