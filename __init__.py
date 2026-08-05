@@ -73,7 +73,7 @@ _TARGET_MODE_ITEMS = (
         "Cut only selected mesh faces",
     ),
 )
-_ADDON_VERSION = "1.5.8"
+_ADDON_VERSION = "1.5.9"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -2342,6 +2342,27 @@ def _connect_face_chains(
                 used_sources.add(source)
                 anchors.add(boundary)
                 return source
+
+            # Retracing a segment back to an earlier snapped path point turns
+            # the outward segment into an interior graph leaf. An edgenet
+            # cannot split a face at a dangling wire, even though that leaf
+            # visually touches the merged junction. Give every such leaf its
+            # own non-cut support to the face boundary so all requested path
+            # edges participate in the resulting face topology.
+            interior_leaves = sorted(
+                (
+                    vert
+                    for vert in component
+                    if vert not in boundary_verts
+                    and len(adjacency.get(vert, ())) == 1
+                ),
+                key=lambda vert: (
+                    vertex_points[vert][0],
+                    vertex_points[vert][1],
+                ),
+            )
+            for leaf in interior_leaves:
+                add_support({leaf})
 
             while len(anchors) < 2:
                 if add_support(component) is None:

@@ -209,10 +209,160 @@ def _closed_contour_from_boundary_case():
     return summary
 
 
+def _snapped_own_point_junction_case():
+    junction = (0.4, 0.45)
+    path = (
+        (0.0, 0.2),
+        junction,
+        (0.75, 0.75),
+        (0.75, 0.3),
+        junction,
+        (1.0, 0.65),
+    )
+    obj, mesh = _new_quad("UVPolylineOwnPointJunction")
+    result = addon._cut_polyline_object(
+        obj,
+        path,
+        target_mode="VISIBLE",
+        split_uv_islands=False,
+        separation=0.0,
+        mark_seams=True,
+        sync_selection=False,
+    )
+    bm = bmesh.from_edit_mesh(mesh)
+    uv_layer = bm.loops.layers.uv.active
+    junction_verts = [
+        vert for vert in bm.verts
+        if junction in _vert_uvs(vert, uv_layer)
+    ]
+    seam_degree = (
+        sum(1 for edge in junction_verts[0].link_edges if edge.seam)
+        if len(junction_verts) == 1
+        else 0
+    )
+    wire_edges = [edge for edge in bm.edges if not edge.link_faces]
+    summary = {
+        "operator_result": result,
+        "junction_vertices": len(junction_verts),
+        "junction_seam_degree": seam_degree,
+        "wire_edges": len(wire_edges),
+        "faces": len(bm.faces),
+    }
+    assert len(junction_verts) == 1, summary
+    assert seam_degree == 4, summary
+    assert not wire_edges, summary
+    assert len(bm.faces) == 4, summary
+    return summary
+
+
+def _two_snapped_junctions_case():
+    junctions = ((0.4, 0.72), (0.55, 0.34))
+    path = (
+        (0.0, 0.3),
+        junctions[0],
+        (0.68, 0.9),
+        (0.72, 0.58),
+        junctions[0],
+        junctions[1],
+        (0.82, 0.25),
+        (0.7, 0.08),
+        junctions[1],
+        (1.0, 0.5),
+    )
+    obj, mesh = _new_quad("UVPolylineTwoOwnPointJunctions")
+    result = addon._cut_polyline_object(
+        obj,
+        path,
+        target_mode="VISIBLE",
+        split_uv_islands=False,
+        separation=0.0,
+        mark_seams=True,
+        sync_selection=False,
+    )
+    bm = bmesh.from_edit_mesh(mesh)
+    uv_layer = bm.loops.layers.uv.active
+    junction_data = []
+    for junction in junctions:
+        vertices = [
+            vert for vert in bm.verts
+            if junction in _vert_uvs(vert, uv_layer)
+        ]
+        seam_degree = (
+            sum(1 for edge in vertices[0].link_edges if edge.seam)
+            if len(vertices) == 1
+            else 0
+        )
+        junction_data.append((len(vertices), seam_degree))
+    wire_edges = [edge for edge in bm.edges if not edge.link_faces]
+    summary = {
+        "operator_result": result,
+        "junctions": junction_data,
+        "wire_edges": len(wire_edges),
+        "faces": len(bm.faces),
+    }
+    assert junction_data == [(1, 4), (1, 4)], summary
+    assert not wire_edges, summary
+    assert len(bm.faces) == 6, summary
+    return summary
+
+
+def _retraced_branch_junctions_case():
+    junctions = ((0.4, 0.72), (0.55, 0.34))
+    path = (
+        (0.0, 0.3),
+        junctions[0],
+        (0.68, 0.9),
+        junctions[0],
+        junctions[1],
+        (0.82, 0.2),
+        junctions[1],
+        (1.0, 0.5),
+    )
+    obj, mesh = _new_quad("UVPolylineRetracedBranches")
+    result = addon._cut_polyline_object(
+        obj,
+        path,
+        target_mode="VISIBLE",
+        split_uv_islands=False,
+        separation=0.0,
+        mark_seams=True,
+        sync_selection=False,
+    )
+    bm = bmesh.from_edit_mesh(mesh)
+    uv_layer = bm.loops.layers.uv.active
+    junction_data = []
+    for junction in junctions:
+        vertices = [
+            vert for vert in bm.verts
+            if junction in _vert_uvs(vert, uv_layer)
+        ]
+        junction_data.append(
+            (
+                len(vertices),
+                len(vertices[0].link_edges) if len(vertices) == 1 else 0,
+            )
+        )
+    wire_edges = [edge for edge in bm.edges if not edge.link_faces]
+    summary = {
+        "operator_result": result,
+        "junctions": junction_data,
+        "wire_edges": len(wire_edges),
+        "faces": len(bm.faces),
+    }
+    assert junction_data == [(1, 3), (1, 3)], summary
+    assert not wire_edges, summary
+    assert result["cut_edges"] == 5, summary
+    assert len(bm.faces) == 4, summary
+    return summary
+
+
 summary = {
     "crossing": _crossing_case(),
     "closed_contour": _closed_contour_case(),
     "closed_from_boundary": _closed_contour_from_boundary_case(),
+    "own_point_junction": _snapped_own_point_junction_case(),
+    "two_own_point_junctions": _two_snapped_junctions_case(),
+    "retraced_branch_junctions": _retraced_branch_junctions_case(),
 }
 print(
     "UV_POLYLINE_INTERSECTIONS_TEST_RESULT="

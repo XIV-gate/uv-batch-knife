@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="uv_batch_knife_reload_test_") as direct
     )
     try:
         old_version = module._ADDON_VERSION
-        new_version = "1.5.9"
+        new_version = "1.6.0"
         module.register()
         bpy.context.scene.uv_batch_knife_mode = "GRID"
         bpy.context.scene.uv_batch_knife_snap_mode = "EDGE_CENTERS"
