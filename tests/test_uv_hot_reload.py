@@ -71,8 +71,13 @@ with tempfile.TemporaryDirectory(prefix="uv_batch_knife_reload_test_") as direct
     )
     try:
         old_version = module._ADDON_VERSION
-        new_version = "1.5.8"
+        new_version = "1.5.9"
         module.register()
+        bpy.context.scene.uv_batch_knife_mode = "GRID"
+        bpy.context.scene.uv_batch_knife_snap_mode = "EDGE_CENTERS"
+        bpy.context.scene.uv_batch_knife_detach_mode = "POLYGONS"
+        bpy.context.scene.uv_batch_knife_separation = 0.001
+        bpy.context.scene.uv_batch_knife_grid_subdivisions = 11
         snapshot = module._capture_extension_snapshot(package_root)
         write_new_version(package_root, old_version, new_version)
         callback = module._make_extension_reload_callback(
@@ -95,6 +100,13 @@ with tempfile.TemporaryDirectory(prefix="uv_batch_knife_reload_test_") as direct
         assert reloaded._ADDON_VERSION == new_version
         assert hasattr(bpy.ops.uv, "batch_knife")
         assert "loaded in this Blender session" in status, status
+        assert bpy.context.scene.uv_batch_knife_mode == "GRID"
+        assert bpy.context.scene.uv_batch_knife_snap_mode == "EDGE_CENTERS"
+        assert bpy.context.scene.uv_batch_knife_detach_mode == "POLYGONS"
+        assert abs(
+            bpy.context.scene.uv_batch_knife_separation - 0.001
+        ) < 1.0e-8
+        assert bpy.context.scene.uv_batch_knife_grid_subdivisions == 11
         results["success"] = {
             "old_version": old_version,
             "new_version": reloaded._ADDON_VERSION,
@@ -113,7 +125,7 @@ with tempfile.TemporaryDirectory(prefix="uv_batch_knife_reload_test_") as direct
         old_version = module._ADDON_VERSION
         module.register()
         snapshot = module._capture_extension_snapshot(package_root)
-        write_new_version(package_root, old_version, "1.5.7")
+        write_new_version(package_root, old_version, "1.5.8")
         callback = module._make_extension_reload_callback(
             module_name,
             "9.9.9",

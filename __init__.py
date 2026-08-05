@@ -52,7 +52,28 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.7"
+_KNIFE_MODE_ITEMS = (
+    ("MULTI", "C1 Multi-Point", "Place and confirm a polyline path"),
+    ("INFINITE", "C2 Infinite Line", "Cut with an infinite line"),
+    ("GRID", "C3 Grid Knife", "Cut with a finite square grid"),
+)
+_SNAP_MODE_ITEMS = tuple(
+    (identifier, _SNAP_MODE_LABELS[identifier], "Last used snap mode")
+    for identifier in _SNAP_MODES
+)
+_TARGET_MODE_ITEMS = (
+    (
+        "VISIBLE",
+        "Visible in UV Editor",
+        "Cut faces visible in the UV Editor",
+    ),
+    (
+        "SELECTED_UV",
+        "Selected Mesh Faces",
+        "Cut only selected mesh faces",
+    ),
+)
+_ADDON_VERSION = "1.5.8"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -958,6 +979,32 @@ def _shift_uv_faces(faces, uv_layer, direction, separation):
             loop[uv_layer].uv.y += shift_y
 
 
+def _capture_mesh_visibility(bm):
+    """Remember which existing BMesh elements were hidden before a cut."""
+    return (
+        {face for face in bm.faces if face.hide},
+        {edge for edge in bm.edges if edge.hide},
+        {vert for vert in bm.verts if vert.hide},
+    )
+
+
+def _restore_mesh_visibility(bm, visibility):
+    """Keep pre-existing hidden elements hidden and every new element visible."""
+    hidden_faces, hidden_edges, hidden_verts = visibility
+    for face in bm.faces:
+        face.hide = face in hidden_faces
+        if face.hide:
+            face.select = False
+    for edge in bm.edges:
+        edge.hide = edge in hidden_edges
+        if edge.hide:
+            edge.select = False
+    for vert in bm.verts:
+        vert.hide = vert in hidden_verts
+        if vert.hide:
+            vert.select = False
+
+
 def _cut_object(
     obj,
     origin,
@@ -993,6 +1040,8 @@ def _cut_object(
             "cut_edges": 0,
             "new_vertices": 0,
         }
+
+    visibility = _capture_mesh_visibility(bm)
 
     if target_mode == "SELECTED_UV":
         target_faces = [
@@ -1076,6 +1125,7 @@ def _cut_object(
 
     if cut_edges or isolation["edges"]:
         bm.select_flush_mode()
+        _restore_mesh_visibility(bm, visibility)
         bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
 
     return {
@@ -2522,6 +2572,8 @@ def _cut_polyline_object(
             "new_vertices": 0,
         }
 
+    visibility = _capture_mesh_visibility(bm)
+
     normalized_points = _planarize_polyline(points)
     target_faces = _scope_faces(
         bm,
@@ -2627,6 +2679,7 @@ def _cut_polyline_object(
     new_vertices = boundary_vertices + interior_vertices
     if cut_edges or new_vertices:
         bm.select_flush_mode()
+        _restore_mesh_visibility(bm, visibility)
         bmesh.update_edit_mesh(
             mesh,
             loop_triangles=True,
@@ -2707,6 +2760,8 @@ def _cut_grid_object(
             "cut_edges": 0,
             "new_vertices": 0,
         }
+
+    visibility = _capture_mesh_visibility(bm)
 
     tag_name = "_uv_batch_knife_grid"
     tag_layer = bm.edges.layers.int.get(tag_name)
@@ -3018,6 +3073,7 @@ def _cut_grid_object(
     cut_edge_count = len(grid_edges)
     cut_face_count = len({face for face in touched_faces if face.is_valid})
     bm.select_flush_mode()
+    _restore_mesh_visibility(bm, visibility)
     bm.edges.layers.int.remove(tag_layer)
 
     if cut_edge_count or isolation["edges"]:
@@ -3324,18 +3380,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
     target_mode: EnumProperty(
         name="Target Faces",
         description="Choose which UV faces can be cut",
-        items=(
-            (
-                "VISIBLE",
-                "Visible in UV Editor",
-                "Cut faces visible in the UV Editor",
-            ),
-            (
-                "SELECTED_UV",
-                "Selected Mesh Faces",
-                "Cut only selected mesh faces",
-            ),
-        ),
+        items=_TARGET_MODE_ITEMS,
         default="VISIBLE",
     )
     cut_mode: EnumProperty(
@@ -3390,18 +3435,21 @@ class UV_OT_batch_knife(bpy.types.Operator):
     split_uv_islands: BoolProperty(
         name="Split UV Islands",
         description=(
-            "Move one cut side by a tiny amount so the two sides become "
-            "separate UV islands"
+            "Create seam boundaries along the cut; optional Separation can "
+            "visually move the resulting UV parts"
         ),
         default=True,
     )
     separation: FloatProperty(
         name="Separation",
-        description="UV offset used to separate the two cut sides",
-        default=0.00002,
+        description=(
+            "Optional UV offset between cut parts; zero preserves the exact "
+            "original UV positions"
+        ),
+        default=0.0,
         min=0.0,
         soft_max=0.01,
-        precision=6,
+        precision=8,
     )
     mark_seams: BoolProperty(
         name="Mark New Edges as Seams",
@@ -3614,6 +3662,47 @@ class UV_OT_batch_knife(bpy.types.Operator):
             return
         self.cut_mode = "LINE"
         self.line_mode = mode
+
+    def _load_last_settings(self, context):
+        scene = context.scene
+        self._set_knife_mode(scene.uv_batch_knife_mode)
+        self._snap_mode = scene.uv_batch_knife_snap_mode
+        self.target_mode = scene.uv_batch_knife_target_mode
+        self.endpoint_extension_mode = (
+            scene.uv_batch_knife_endpoint_extension_mode
+        )
+        self.detach_mode = scene.uv_batch_knife_detach_mode
+        if (
+            self.detach_mode == "OFF"
+            and scene.uv_batch_knife_isolate_uv_islands
+        ):
+            self.detach_mode = "ISLANDS"
+        self.isolate_uv_islands = self.detach_mode == "ISLANDS"
+        self.split_uv_islands = scene.uv_batch_knife_split_uv_islands
+        self.separation = scene.uv_batch_knife_separation
+        self.mark_seams = scene.uv_batch_knife_mark_seams
+        self.grid_size = scene.uv_batch_knife_grid_size
+        self.grid_angle = scene.uv_batch_knife_grid_angle
+        self.grid_subdivisions = scene.uv_batch_knife_grid_subdivisions
+
+    def _store_last_settings(self, context):
+        scene = context.scene
+        scene.uv_batch_knife_mode = self._knife_mode()
+        scene.uv_batch_knife_snap_mode = self._snap_mode
+        scene.uv_batch_knife_target_mode = self.target_mode
+        scene.uv_batch_knife_endpoint_extension_mode = (
+            self.endpoint_extension_mode
+        )
+        scene.uv_batch_knife_detach_mode = self.detach_mode
+        scene.uv_batch_knife_isolate_uv_islands = (
+            self.detach_mode == "ISLANDS"
+        )
+        scene.uv_batch_knife_split_uv_islands = self.split_uv_islands
+        scene.uv_batch_knife_separation = self.separation
+        scene.uv_batch_knife_mark_seams = self.mark_seams
+        scene.uv_batch_knife_grid_size = self.grid_size
+        scene.uv_batch_knife_grid_angle = self.grid_angle
+        scene.uv_batch_knife_grid_subdivisions = self.grid_subdivisions
 
     def _knife_mode_label(self):
         return {
@@ -3932,26 +4021,13 @@ class UV_OT_batch_knife(bpy.types.Operator):
         global _active_batch_knife_modals
         self._area = context.area
         self._area_pointer = context.area.as_pointer()
-        self.cut_mode = "LINE"
-        self.line_mode = "MULTI"
-        self.endpoint_extension_mode = (
-            context.scene.uv_batch_knife_endpoint_extension_mode
-        )
-        self.detach_mode = context.scene.uv_batch_knife_detach_mode
-        if (
-            self.detach_mode == "OFF"
-            and context.scene.uv_batch_knife_isolate_uv_islands
-        ):
-            self.detach_mode = "ISLANDS"
-        self.isolate_uv_islands = self.detach_mode == "ISLANDS"
-        self.grid_subdivisions = 2
+        self._load_last_settings(context)
         self._pixel_start = None
         self._pixel_end = (event.mouse_region_x, event.mouse_region_y)
         self._pixel_raw_end = self._pixel_end
         self._axis_lock = None
         self._active_axis = None
         self._snap_active = False
-        self._snap_mode = "OFF"
         self._point_snap_hit = False
         self._current_snap_uv = None
         self._start_snap_uv = None
@@ -3976,6 +4052,12 @@ class UV_OT_batch_knife(bpy.types.Operator):
         context.window.cursor_modal_set("KNIFE")
         self._cursor_is_modal = True
         context.window_manager.modal_handler_add(self)
+        if self._snap_mode in {
+            "POINTS",
+            "EDGE_CENTERS",
+            "FACE_CENTERS",
+        }:
+            self._build_snap_cache(context)
         _active_batch_knife_modals += 1
         self._reload_modal_tracked = True
         self._set_status_text(context)
@@ -4020,6 +4102,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
             self._snap_tree = None
             self._snap_points = None
             self._current_grid_snap_step = None
+            context.scene.uv_batch_knife_snap_mode = self._snap_mode
             if self._snap_mode in {
                 "POINTS",
                 "EDGE_CENTERS",
@@ -4077,6 +4160,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
                 (mode_index + 1) % len(_KNIFE_MODES)
             ]
             self._set_knife_mode(next_mode)
+            context.scene.uv_batch_knife_mode = next_mode
             self._axis_lock = None
             self._active_axis = None
             self._grid_segments_pixel = ()
@@ -4159,6 +4243,9 @@ class UV_OT_batch_knife(bpy.types.Operator):
             self.grid_subdivisions = min(
                 64,
                 max(1, self.grid_subdivisions + increment),
+            )
+            context.scene.uv_batch_knife_grid_subdivisions = (
+                self.grid_subdivisions
             )
             self._update_grid_preview(
                 context,
@@ -4289,6 +4376,7 @@ class UV_OT_batch_knife(bpy.types.Operator):
 
     def execute(self, context):
         started = time.perf_counter()
+        self._store_last_settings(context)
         sync_selection = context.scene.tool_settings.use_uv_select_sync
         results = []
         if self.cut_mode == "GRID":
@@ -4501,6 +4589,24 @@ def register():
         items=_ENDPOINT_EXTENSION_ITEMS,
         default="NEAREST_CORNER",
     )
+    bpy.types.Scene.uv_batch_knife_mode = EnumProperty(
+        name="Last Knife Mode",
+        description="Last UV Batch Knife mode used in this scene",
+        items=_KNIFE_MODE_ITEMS,
+        default="MULTI",
+    )
+    bpy.types.Scene.uv_batch_knife_snap_mode = EnumProperty(
+        name="Last Snap Mode",
+        description="Last UV Batch Knife snap mode used in this scene",
+        items=_SNAP_MODE_ITEMS,
+        default="OFF",
+    )
+    bpy.types.Scene.uv_batch_knife_target_mode = EnumProperty(
+        name="Last Target Mode",
+        description="Last UV Batch Knife target scope used in this scene",
+        items=_TARGET_MODE_ITEMS,
+        default="VISIBLE",
+    )
     bpy.types.Scene.uv_batch_knife_isolate_uv_islands = BoolProperty(
         name="Detach Cut UV Islands",
         description=(
@@ -4514,6 +4620,45 @@ def register():
         description="Choose which source topology is detached before cutting",
         items=_DETACH_MODE_ITEMS,
         default="OFF",
+    )
+    bpy.types.Scene.uv_batch_knife_split_uv_islands = BoolProperty(
+        name="Split UV Islands",
+        description="Last Split UV Islands state used in this scene",
+        default=True,
+    )
+    bpy.types.Scene.uv_batch_knife_separation = FloatProperty(
+        name="Separation",
+        description="Last UV separation offset used in this scene",
+        default=0.0,
+        min=0.0,
+        soft_max=0.01,
+        precision=8,
+    )
+    bpy.types.Scene.uv_batch_knife_mark_seams = BoolProperty(
+        name="Mark New Edges as Seams",
+        description="Last seam marking state used in this scene",
+        default=True,
+    )
+    bpy.types.Scene.uv_batch_knife_grid_size = FloatProperty(
+        name="Grid Size",
+        description="Last square grid size used in this scene",
+        default=0.5,
+        min=0.000001,
+        soft_max=2.0,
+        precision=5,
+    )
+    bpy.types.Scene.uv_batch_knife_grid_angle = FloatProperty(
+        name="Grid Angle",
+        description="Last square grid angle used in this scene",
+        default=0.0,
+        subtype="ANGLE",
+    )
+    bpy.types.Scene.uv_batch_knife_grid_subdivisions = IntProperty(
+        name="Grid Subdivisions",
+        description="Last square grid subdivision count used in this scene",
+        default=2,
+        min=1,
+        max=64,
     )
     for cls in _classes:
         bpy.utils.register_class(cls)
@@ -4546,6 +4691,15 @@ def unregister():
         bpy.utils.unregister_class(cls)
 
     del bpy.types.WindowManager.uv_batch_knife_update_status
+    del bpy.types.Scene.uv_batch_knife_grid_subdivisions
+    del bpy.types.Scene.uv_batch_knife_grid_angle
+    del bpy.types.Scene.uv_batch_knife_grid_size
+    del bpy.types.Scene.uv_batch_knife_mark_seams
+    del bpy.types.Scene.uv_batch_knife_separation
+    del bpy.types.Scene.uv_batch_knife_split_uv_islands
     del bpy.types.Scene.uv_batch_knife_detach_mode
     del bpy.types.Scene.uv_batch_knife_isolate_uv_islands
+    del bpy.types.Scene.uv_batch_knife_target_mode
+    del bpy.types.Scene.uv_batch_knife_snap_mode
+    del bpy.types.Scene.uv_batch_knife_mode
     del bpy.types.Scene.uv_batch_knife_endpoint_extension_mode

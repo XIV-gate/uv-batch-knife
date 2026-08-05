@@ -137,12 +137,92 @@ try:
         item.identifier for item in detach_property.enum_items
     ) == ("OFF", "ISLANDS", "POLYGONS")
     assert detach_property.default == "OFF"
+    assert operator_rna.properties["separation"].default == 0.0
     assert (
         bpy.context.scene.uv_batch_knife_endpoint_extension_mode
         == "NEAREST_CORNER"
     )
     assert not bpy.context.scene.uv_batch_knife_isolate_uv_islands
     assert bpy.context.scene.uv_batch_knife_detach_mode == "OFF"
+    assert bpy.context.scene.uv_batch_knife_mode == "MULTI"
+    assert bpy.context.scene.uv_batch_knife_snap_mode == "OFF"
+    assert bpy.context.scene.uv_batch_knife_target_mode == "VISIBLE"
+    assert bpy.context.scene.uv_batch_knife_split_uv_islands
+    assert bpy.context.scene.uv_batch_knife_separation == 0.0
+    assert bpy.context.scene.uv_batch_knife_mark_seams
+    assert bpy.context.scene.uv_batch_knife_grid_size == 0.5
+    assert bpy.context.scene.uv_batch_knife_grid_angle == 0.0
+    assert bpy.context.scene.uv_batch_knife_grid_subdivisions == 2
+
+    scene = bpy.context.scene
+    scene.uv_batch_knife_mode = "GRID"
+    scene.uv_batch_knife_snap_mode = "FACE_CENTERS"
+    scene.uv_batch_knife_target_mode = "SELECTED_UV"
+    scene.uv_batch_knife_endpoint_extension_mode = "NEAREST_EDGE"
+    scene.uv_batch_knife_detach_mode = "POLYGONS"
+    scene.uv_batch_knife_split_uv_islands = False
+    scene.uv_batch_knife_separation = 0.00125
+    scene.uv_batch_knife_mark_seams = False
+    scene.uv_batch_knife_grid_size = 0.75
+    scene.uv_batch_knife_grid_angle = 0.25
+    scene.uv_batch_knife_grid_subdivisions = 7
+
+    remembered = SimpleNamespace()
+    remembered._set_knife_mode = lambda mode: (
+        setattr(remembered, "cut_mode", "GRID")
+        if mode == "GRID"
+        else (
+            setattr(remembered, "cut_mode", "LINE"),
+            setattr(remembered, "line_mode", mode),
+        )
+    )
+    addon.UV_OT_batch_knife._load_last_settings(
+        remembered,
+        SimpleNamespace(scene=scene),
+    )
+    assert remembered.cut_mode == "GRID"
+    assert remembered._snap_mode == "FACE_CENTERS"
+    assert remembered.target_mode == "SELECTED_UV"
+    assert remembered.endpoint_extension_mode == "NEAREST_EDGE"
+    assert remembered.detach_mode == "POLYGONS"
+    assert not remembered.split_uv_islands
+    assert abs(remembered.separation - 0.00125) < 1.0e-9
+    assert not remembered.mark_seams
+    assert abs(remembered.grid_size - 0.75) < 1.0e-9
+    assert abs(remembered.grid_angle - 0.25) < 1.0e-9
+    assert remembered.grid_subdivisions == 7
+
+    remembered.cut_mode = "LINE"
+    remembered.line_mode = "INFINITE"
+    remembered._knife_mode = lambda: (
+        "GRID" if remembered.cut_mode == "GRID" else remembered.line_mode
+    )
+    remembered._snap_mode = "UV_GRID"
+    remembered.target_mode = "VISIBLE"
+    remembered.endpoint_extension_mode = "NEAREST_CORNER"
+    remembered.detach_mode = "ISLANDS"
+    remembered.split_uv_islands = True
+    remembered.separation = 0.0
+    remembered.mark_seams = True
+    remembered.grid_size = 1.25
+    remembered.grid_angle = -0.5
+    remembered.grid_subdivisions = 9
+    addon.UV_OT_batch_knife._store_last_settings(
+        remembered,
+        SimpleNamespace(scene=scene),
+    )
+    assert scene.uv_batch_knife_mode == "INFINITE"
+    assert scene.uv_batch_knife_snap_mode == "UV_GRID"
+    assert scene.uv_batch_knife_target_mode == "VISIBLE"
+    assert scene.uv_batch_knife_endpoint_extension_mode == "NEAREST_CORNER"
+    assert scene.uv_batch_knife_detach_mode == "ISLANDS"
+    assert scene.uv_batch_knife_isolate_uv_islands
+    assert scene.uv_batch_knife_split_uv_islands
+    assert scene.uv_batch_knife_separation == 0.0
+    assert scene.uv_batch_knife_mark_seams
+    assert abs(scene.uv_batch_knife_grid_size - 1.25) < 1.0e-9
+    assert abs(scene.uv_batch_knife_grid_angle + 0.5) < 1.0e-9
+    assert scene.uv_batch_knife_grid_subdivisions == 9
 finally:
     addon.unregister()
 
