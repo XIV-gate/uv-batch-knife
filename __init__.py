@@ -49,7 +49,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.3"
+_ADDON_VERSION = "1.5.4"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -575,10 +575,17 @@ def _collect_face_cut(
             (first["point"][0] + second["point"][0]) * 0.5,
             (first["point"][1] + second["point"][1]) * 0.5,
         )
-        if _point_in_polygon(midpoint, polygon):
-            pairs.append((first, second))
-            used_descriptors.add(id(first))
-            used_descriptors.add(id(second))
+        if not _point_in_polygon(midpoint, polygon):
+            continue
+        # A preceding grid line may already have split a boundary edge into a
+        # collinear chain. Connecting the chain's outer vertices again would
+        # create a zero-area face. It also catches sub-epsilon offsets that are
+        # visually coincident with the existing UV boundary.
+        if _point_on_polygon_boundary(midpoint, polygon):
+            continue
+        pairs.append((first, second))
+        used_descriptors.add(id(first))
+        used_descriptors.add(id(second))
 
     if not pairs:
         return None
