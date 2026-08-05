@@ -28,6 +28,7 @@ QUAD_UVS = (
     (1.0, 1.0),
     (0.0, 1.0),
 )
+INSET_TOLERANCE = addon._MIN_UV_ISLAND_INSET * 1.5
 
 
 def run_case(name, endpoint_extension_mode):
@@ -66,7 +67,7 @@ def run_case(name, endpoint_extension_mode):
         CLICKED_POINTS,
         target_mode="VISIBLE",
         split_uv_islands=True,
-        separation=0.00002,
+        separation=0.0,
         mark_seams=True,
         sync_selection=False,
         endpoint_extension_mode=endpoint_extension_mode,
@@ -86,11 +87,22 @@ def run_case(name, endpoint_extension_mode):
             for vert in edge.verts
         ):
             discontinuous_seams += 1
-    all_uvs = {
-        (round(loop[uv].uv.x, 6), round(loop[uv].uv.y, 6))
+    all_uvs = [
+        (float(loop[uv].uv.x), float(loop[uv].uv.y))
         for face in bm.faces
         for loop in face.loops
-    }
+    ]
+
+    def nearest_distance(point):
+        return min(
+            ((candidate[0] - point[0]) ** 2
+             + (candidate[1] - point[1]) ** 2) ** 0.5
+            for candidate in all_uvs
+        )
+
+    clicked_offsets = [
+        nearest_distance(point) for point in CLICKED_POINTS
+    ]
     summary = {
         "operator_result": result,
         "verts": len(bm.verts),
@@ -98,10 +110,10 @@ def run_case(name, endpoint_extension_mode):
         "faces": len(bm.faces),
         "seams": len(seam_edges),
         "discontinuous_seams": discontinuous_seams,
-        "clicked_uvs_present": all(point in all_uvs for point in CLICKED_POINTS),
+        "clicked_uv_offsets": clicked_offsets,
         "edge_extension_points": {
-            "start": (0.5, 0.0) in all_uvs,
-            "end": (1.0, 0.6) in all_uvs,
+            "start": nearest_distance((0.5, 0.0)) <= INSET_TOLERANCE,
+            "end": nearest_distance((1.0, 0.6)) <= INSET_TOLERANCE,
         },
     }
     bpy.ops.object.mode_set(mode="OBJECT")
@@ -125,7 +137,10 @@ for summary in (corner_summary, edge_summary):
     assert summary["faces"] == 4, summary
     assert summary["seams"] == 8, summary
     assert summary["discontinuous_seams"] == 8, summary
-    assert summary["clicked_uvs_present"], summary
+    assert all(
+        addon._UV_EPS < offset <= INSET_TOLERANCE
+        for offset in summary["clicked_uv_offsets"]
+    ), summary
 
 assert corner_summary["operator_result"]["new_vertices"] == 6, corner_summary
 assert not any(corner_summary["edge_extension_points"].values()), corner_summary

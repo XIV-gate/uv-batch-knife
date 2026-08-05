@@ -137,7 +137,10 @@ try:
         item.identifier for item in detach_property.enum_items
     ) == ("OFF", "ISLANDS", "POLYGONS")
     assert detach_property.default == "OFF"
-    assert operator_rna.properties["separation"].default == 0.0
+    assert abs(
+        operator_rna.properties["separation"].default
+        - addon._MIN_UV_ISLAND_INSET
+    ) < 1.0e-10
     assert (
         bpy.context.scene.uv_batch_knife_endpoint_extension_mode
         == "NEAREST_CORNER"
@@ -148,7 +151,10 @@ try:
     assert bpy.context.scene.uv_batch_knife_snap_mode == "OFF"
     assert bpy.context.scene.uv_batch_knife_target_mode == "VISIBLE"
     assert bpy.context.scene.uv_batch_knife_split_uv_islands
-    assert bpy.context.scene.uv_batch_knife_separation == 0.0
+    assert abs(
+        bpy.context.scene.uv_batch_knife_separation
+        - addon._MIN_UV_ISLAND_INSET
+    ) < 1.0e-10
     assert bpy.context.scene.uv_batch_knife_mark_seams
     assert bpy.context.scene.uv_batch_knife_grid_size == 0.5
     assert bpy.context.scene.uv_batch_knife_grid_angle == 0.0

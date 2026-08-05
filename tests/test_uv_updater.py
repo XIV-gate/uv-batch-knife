@@ -89,7 +89,7 @@ license = ["SPDX:GPL-3.0-or-later"]
         encoding="utf-8",
     )
     (install_root / "blender_manifest.toml").write_text(
-        manifest_text.replace('version = "1.6.0"', 'version = "1.5.9"'),
+        manifest_text.replace('version = "1.6.0"', 'version = "1.5.10"'),
         encoding="utf-8",
     )
     installed_files = addon._install_update_archive(

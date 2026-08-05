@@ -36,6 +36,7 @@ from mathutils.kdtree import KDTree
 
 _UV_EPS = 1.0e-7
 _FACTOR_EPS = 1.0e-6
+_MIN_UV_ISLAND_INSET = 1.0e-6
 _POINT_SNAP_RADIUS_PX = 18.0
 _SNAP_MODES = (
     "OFF",
@@ -73,7 +74,7 @@ _TARGET_MODE_ITEMS = (
         "Cut only selected mesh faces",
     ),
 )
-_ADDON_VERSION = "1.5.9"
+_ADDON_VERSION = "1.5.10"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -917,66 +918,186 @@ def _connect_face_pairs(
     return cut_edges, cut_faces
 
 
-def _positive_cut_side_faces(
+def _cut_uv_face_components(all_target_faces, cut_edges, uv_layer):
+    """Return UV-continuous face components separated by the new cut."""
+    valid_faces = {face for face in all_target_faces if face.is_valid}
+    separators = {edge for edge in cut_edges if edge.is_valid}
+    seeds = {
+        face
+        for edge in separators
+        for face in edge.link_faces
+        if face in valid_faces
+    }
+    components = []
+    visited = set()
+    for seed in seeds:
+        if seed in visited:
+            continue
+        component = {seed}
+        visited.add(seed)
+        queue = deque((seed,))
+        while queue:
+            face = queue.popleft()
+            for edge in face.edges:
+                if edge in separators or edge.seam:
+                    continue
+                for neighbor in edge.link_faces:
+                    if (
+                        neighbor is face
+                        or neighbor in visited
+                        or neighbor not in valid_faces
+                    ):
+                        continue
+                    if not _uv_continuous_across(
+                        face,
+                        neighbor,
+                        edge,
+                        uv_layer,
+                    ):
+                        continue
+                    visited.add(neighbor)
+                    component.add(neighbor)
+                    queue.append(neighbor)
+        components.append(component)
+    return components
+
+
+def _uv_loop_node_key(loop, uv_layer):
+    uv = loop[uv_layer].uv
+    return loop.vert, float(uv.x), float(uv.y)
+
+
+def _inset_uv_face_components(
+    components,
+    cut_edges,
+    uv_layer,
+    separation,
+):
+    """Inset every component boundary along each UV corner angle bisector."""
+    separators = {edge for edge in cut_edges if edge.is_valid}
+    requested_inset = max(
+        float(separation),
+        _MIN_UV_ISLAND_INSET,
+    )
+    moved_nodes = 0
+
+    for component in components:
+        component = {face for face in component if face.is_valid}
+        if not component:
+            continue
+
+        node_loops = {}
+        inward_normals = {}
+        boundary_lengths = []
+        for face in component:
+            loops = list(face.loops)
+            polygon = [
+                (
+                    float(loop[uv_layer].uv.x),
+                    float(loop[uv_layer].uv.y),
+                )
+                for loop in loops
+            ]
+            signed_area_twice = sum(
+                _cross2(point, polygon[(index + 1) % len(polygon)])
+                for index, point in enumerate(polygon)
+            )
+
+            for loop in loops:
+                key = _uv_loop_node_key(loop, uv_layer)
+                node_loops.setdefault(key, set()).add(loop)
+
+            for index, loop in enumerate(loops):
+                edge = loop.edge
+                internal = False
+                if edge not in separators and not edge.seam:
+                    internal = any(
+                        neighbor is not face
+                        and neighbor in component
+                        and _uv_continuous_across(
+                            face,
+                            neighbor,
+                            edge,
+                            uv_layer,
+                        )
+                        for neighbor in edge.link_faces
+                    )
+                if internal:
+                    continue
+
+                start = polygon[index]
+                end = polygon[(index + 1) % len(polygon)]
+                direction = _sub2(end, start)
+                length = math.hypot(direction[0], direction[1])
+                if length <= _UV_EPS:
+                    continue
+                boundary_lengths.append(length)
+                if signed_area_twice >= 0.0:
+                    inward = (
+                        -direction[1] / length,
+                        direction[0] / length,
+                    )
+                else:
+                    inward = (
+                        direction[1] / length,
+                        -direction[0] / length,
+                    )
+
+                next_loop = loop.link_loop_next
+                for boundary_loop in (loop, next_loop):
+                    key = _uv_loop_node_key(boundary_loop, uv_layer)
+                    inward_normals.setdefault(key, []).append(inward)
+
+        if not inward_normals:
+            continue
+
+        component_inset = requested_inset
+        if boundary_lengths:
+            component_inset = min(
+                component_inset,
+                min(boundary_lengths) * 0.1,
+            )
+
+        movements = {}
+        for key, normals in inward_normals.items():
+            normal_x = sum(normal[0] for normal in normals)
+            normal_y = sum(normal[1] for normal in normals)
+            normal_length = math.hypot(normal_x, normal_y)
+            if normal_length <= _UV_EPS:
+                normal_x, normal_y = normals[0]
+                normal_length = 1.0
+            movements[key] = (
+                normal_x / normal_length * component_inset,
+                normal_y / normal_length * component_inset,
+            )
+
+        for key, movement in movements.items():
+            for loop in node_loops.get(key, ()):
+                uv = loop[uv_layer].uv
+                uv.x += movement[0]
+                uv.y += movement[1]
+            moved_nodes += 1
+
+    return moved_nodes
+
+
+def _inset_cut_uv_islands(
     all_target_faces,
     cut_edges,
     uv_layer,
-    origin,
-    direction,
+    separation,
 ):
-    if not cut_edges:
-        return set()
-
-    valid_target_faces = {face for face in all_target_faces if face.is_valid}
-    sign_cache = {}
-
-    def face_sign(face):
-        cached = sign_cache.get(face)
-        if cached is not None:
-            return cached
-        value = _signed_distance(_face_uv_centroid(face, uv_layer), origin, direction)
-        sign_cache[face] = value
-        return value
-
-    seeds = set()
-    for edge in cut_edges:
-        for face in edge.link_faces:
-            if face in valid_target_faces and face_sign(face) > _UV_EPS:
-                seeds.add(face)
-
-    result = set(seeds)
-    queue = deque(seeds)
-    while queue:
-        face = queue.popleft()
-        for edge in face.edges:
-            if edge in cut_edges or edge.seam:
-                continue
-            for neighbor in edge.link_faces:
-                if neighbor is face or neighbor in result:
-                    continue
-                if neighbor not in valid_target_faces:
-                    continue
-                if face_sign(neighbor) < -_UV_EPS:
-                    continue
-                if not _uv_continuous_across(face, neighbor, edge, uv_layer):
-                    continue
-                result.add(neighbor)
-                queue.append(neighbor)
-    return result
-
-
-def _shift_uv_faces(faces, uv_layer, direction, separation):
-    length = (direction[0] * direction[0] + direction[1] * direction[1]) ** 0.5
-    if length <= _UV_EPS or separation <= 0.0:
-        return
-    shift_x = -direction[1] / length * separation
-    shift_y = direction[0] / length * separation
-    for face in faces:
-        if not face.is_valid:
-            continue
-        for loop in face.loops:
-            loop[uv_layer].uv.x += shift_x
-            loop[uv_layer].uv.y += shift_y
+    components = _cut_uv_face_components(
+        all_target_faces,
+        cut_edges,
+        uv_layer,
+    )
+    return _inset_uv_face_components(
+        components,
+        cut_edges,
+        uv_layer,
+        separation,
+    )
 
 
 def _capture_mesh_visibility(bm):
@@ -1113,15 +1234,13 @@ def _cut_object(
         mark_seams,
     )
 
-    if split_uv_islands and cut_edges and separation > 0.0:
-        positive_faces = _positive_cut_side_faces(
+    if split_uv_islands and cut_edges:
+        _inset_cut_uv_islands(
             all_target_faces,
             cut_edges,
             uv_layer,
-            origin,
-            direction,
+            separation,
         )
-        _shift_uv_faces(positive_faces, uv_layer, direction, separation)
 
     if cut_edges or isolation["edges"]:
         bm.select_flush_mode()
@@ -2447,118 +2566,6 @@ def _connect_face_chains(
     )
 
 
-def _positive_polyline_side_faces(
-    all_target_faces,
-    cut_edges,
-    edge_directions,
-    uv_layer,
-):
-    valid_faces = {face for face in all_target_faces if face.is_valid}
-    boundary_faces = {
-        face
-        for edge in cut_edges
-        for face in edge.link_faces
-        if face in valid_faces
-    }
-    components = []
-    face_components = {}
-    for seed in boundary_faces:
-        if seed in face_components:
-            continue
-        component_index = len(components)
-        component = {seed}
-        face_components[seed] = component_index
-        queue = deque([seed])
-        while queue:
-            face = queue.popleft()
-            for edge in face.edges:
-                if edge in cut_edges or edge.seam:
-                    continue
-                for neighbor in edge.link_faces:
-                    if neighbor is face or neighbor not in valid_faces:
-                        continue
-                    if neighbor in face_components:
-                        continue
-                    if not _uv_continuous_across(
-                        face,
-                        neighbor,
-                        edge,
-                        uv_layer,
-                    ):
-                        continue
-                    face_components[neighbor] = component_index
-                    component.add(neighbor)
-                    queue.append(neighbor)
-        components.append(component)
-
-    adjacency = {index: set() for index in range(len(components))}
-    positive_votes = [0 for _component in components]
-    for edge in cut_edges:
-        direction_points = edge_directions.get(edge)
-        if direction_points is None:
-            continue
-        linked_components = {
-            face_components[face]
-            for face in edge.link_faces
-            if face in face_components
-        }
-        for component_a in linked_components:
-            adjacency[component_a].update(
-                component_b
-                for component_b in linked_components
-                if component_b != component_a
-            )
-
-        origin, end = direction_points
-        direction = _sub2(end, origin)
-        for face in edge.link_faces:
-            if face not in face_components:
-                continue
-            loop = _loop_for_edge(face, edge)
-            if loop is None:
-                continue
-            side = 0.0
-            neighbor_loops = (
-                loop.link_loop_prev,
-                loop.link_loop_next.link_loop_next,
-            )
-            for neighbor_loop in neighbor_loops:
-                neighbor_uv = neighbor_loop[uv_layer].uv
-                side = _signed_distance(
-                    (neighbor_uv.x, neighbor_uv.y),
-                    origin,
-                    direction,
-                )
-                if abs(side) > _UV_EPS:
-                    break
-            if side > _UV_EPS:
-                positive_votes[face_components[face]] += 1
-
-    result = set()
-    visited_components = set()
-    for root in range(len(components)):
-        if root in visited_components or not adjacency[root]:
-            continue
-        colors = {root: 0}
-        group_queue = deque([root])
-        visited_components.add(root)
-        while group_queue:
-            component = group_queue.popleft()
-            for neighbor in adjacency[component]:
-                if neighbor not in colors:
-                    colors[neighbor] = 1 - colors[component]
-                    visited_components.add(neighbor)
-                    group_queue.append(neighbor)
-        vote_totals = [0, 0]
-        for component, color in colors.items():
-            vote_totals[color] += positive_votes[component]
-        selected_color = 0 if vote_totals[0] >= vote_totals[1] else 1
-        for component, color in colors.items():
-            if color == selected_color:
-                result.update(components[component])
-    return result
-
-
 def _cut_polyline_object(
     obj,
     points,
@@ -2664,7 +2671,7 @@ def _cut_polyline_object(
         cut_edges,
         cut_faces,
         interior_vertices,
-        edge_directions,
+        _edge_directions,
     ) = _connect_face_chains(
         bm,
         face_records,
@@ -2673,29 +2680,13 @@ def _cut_polyline_object(
         mark_seams,
     )
 
-    if split_uv_islands and cut_edges and separation > 0.0:
-        positive_faces = _positive_polyline_side_faces(
+    if split_uv_islands and cut_edges:
+        _inset_cut_uv_islands(
             all_target_faces,
             cut_edges,
-            edge_directions,
             uv_layer,
+            separation,
         )
-        direction = None
-        for point_a, point_b in zip(
-            normalized_points,
-            normalized_points[1:],
-        ):
-            candidate = _sub2(point_b, point_a)
-            if candidate[0] * candidate[0] + candidate[1] * candidate[1] > _UV_EPS:
-                direction = candidate
-                break
-        if direction is not None:
-            _shift_uv_faces(
-                positive_faces,
-                uv_layer,
-                direction,
-                separation,
-            )
 
     new_vertices = boundary_vertices + interior_vertices
     if cut_edges or new_vertices:
@@ -3047,8 +3038,8 @@ def _cut_grid_object(
             edge.seam = True
             edge.select = True
 
-    if split_uv_islands and grid_edges and separation > 0.0:
-        inside_faces = [
+    if split_uv_islands and grid_edges:
+        split_faces = [
             face
             for face in _scope_faces(
                 bm,
@@ -3057,39 +3048,13 @@ def _cut_grid_object(
                 sync_selection,
             )
             if face.is_valid
-            and _face_fully_inside_grid(
-                face,
-                uv_layer,
-                center,
-                axis_x,
-                axis_y,
-                half_size,
-            )
         ]
-        for face in inside_faces:
-            local = _grid_local(
-                _face_uv_centroid(face, uv_layer),
-                center,
-                axis_x,
-                axis_y,
-            )
-            column = min(
-                subdivisions - 1,
-                max(0, int((local[0] + half_size) / cell_size)),
-            )
-            row = min(
-                subdivisions - 1,
-                max(0, int((local[1] + half_size) / cell_size)),
-            )
-            shift_x = separation * (column + 1)
-            shift_y = separation * (row + 1)
-            world_shift = (
-                axis_x[0] * shift_x + axis_y[0] * shift_y,
-                axis_x[1] * shift_x + axis_y[1] * shift_y,
-            )
-            for loop in face.loops:
-                loop[uv_layer].uv.x += world_shift[0]
-                loop[uv_layer].uv.y += world_shift[1]
+        _inset_cut_uv_islands(
+            split_faces,
+            grid_edges,
+            uv_layer,
+            separation,
+        )
 
     cut_edge_count = len(grid_edges)
     cut_face_count = len({face for face in touched_faces if face.is_valid})
@@ -3456,18 +3421,18 @@ class UV_OT_batch_knife(bpy.types.Operator):
     split_uv_islands: BoolProperty(
         name="Split UV Islands",
         description=(
-            "Create seam boundaries along the cut; optional Separation can "
-            "visually move the resulting UV parts"
+            "Separate cut UV parts with a minimal inward corner-bisector "
+            "inset"
         ),
         default=True,
     )
     separation: FloatProperty(
-        name="Separation",
+        name="Island Inset",
         description=(
-            "Optional UV offset between cut parts; zero preserves the exact "
-            "original UV positions"
+            "Inward boundary inset in UV units; values below the reliable "
+            "minimum still use the minimum"
         ),
-        default=0.0,
+        default=_MIN_UV_ISLAND_INSET,
         min=0.0,
         soft_max=0.01,
         precision=8,
@@ -4648,9 +4613,9 @@ def register():
         default=True,
     )
     bpy.types.Scene.uv_batch_knife_separation = FloatProperty(
-        name="Separation",
-        description="Last UV separation offset used in this scene",
-        default=0.0,
+        name="Island Inset",
+        description="Last UV island boundary inset used in this scene",
+        default=_MIN_UV_ISLAND_INSET,
         min=0.0,
         soft_max=0.01,
         precision=8,

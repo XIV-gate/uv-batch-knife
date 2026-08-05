@@ -102,7 +102,7 @@ result = addon._cut_object(
     target_mode="VISIBLE",
     extend_line=True,
     split_uv_islands=True,
-    separation=0.00002,
+    separation=0.0,
     mark_seams=True,
     sync_selection=False,
 )

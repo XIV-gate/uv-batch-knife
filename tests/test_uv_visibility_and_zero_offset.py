@@ -89,11 +89,39 @@ assert hidden_faces == [hidden_face], {
 assert len(visible_faces) > 1, result
 
 expected_coordinates = (0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0)
+coordinate_offsets = []
 for face in visible_faces:
     for loop in face.loops:
         uv = loop[uv_layer].uv
-        assert any(abs(uv.x - value) < 1.0e-6 for value in expected_coordinates), uv.x
-        assert any(abs(uv.y - value) < 1.0e-6 for value in expected_coordinates), uv.y
+        coordinate_offsets.append(
+            min(
+                ((uv.x - x) ** 2 + (uv.y - y) ** 2) ** 0.5
+                for x in expected_coordinates
+                for y in expected_coordinates
+            )
+        )
+
+assert max(coordinate_offsets) <= addon._MIN_UV_ISLAND_INSET * 1.5
+assert max(coordinate_offsets) >= addon._MIN_UV_ISLAND_INSET * 0.8
+
+seam_pairs = []
+for edge in bm.edges:
+    if not edge.seam or len(edge.link_faces) != 2:
+        continue
+    map_a = addon._edge_uvs_by_vertex(
+        edge.link_faces[0], edge, uv_layer
+    )
+    map_b = addon._edge_uvs_by_vertex(
+        edge.link_faces[1], edge, uv_layer
+    )
+    seam_pairs.append(
+        any(
+            addon._dist_sq(map_a[vert], map_b[vert])
+            > addon._UV_EPS * addon._UV_EPS
+            for vert in edge.verts
+        )
+    )
+assert seam_pairs and all(seam_pairs)
 
 assert all(not face.hide for face in visible_faces)
 assert all(
@@ -112,6 +140,8 @@ summary = {
     "faces": len(bm.faces),
     "hidden_faces": len(hidden_faces),
     "visible_faces": len(visible_faces),
+    "maximum_inset": max(coordinate_offsets),
+    "discontinuous_seams": sum(seam_pairs),
 }
 print(
     "UV_VISIBILITY_ZERO_OFFSET_TEST_RESULT="
