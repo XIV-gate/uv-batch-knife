@@ -1,7 +1,8 @@
 import math
 import json
+import os
 import pathlib
-import subprocess
+import shutil
 import tempfile
 import textwrap
 import time
@@ -48,7 +49,7 @@ _SNAP_MODE_LABELS = {
     "FACE_CENTERS": "S4 Face Centers",
 }
 _KNIFE_MODES = ("MULTI", "INFINITE", "GRID")
-_ADDON_VERSION = "1.5.2"
+_ADDON_VERSION = "1.5.3"
 _ADDON_ID = "uv_batch_knife"
 _GITHUB_REPOSITORY = "XIV-gate/uv-batch-knife"
 _GITHUB_LATEST_RELEASE_API = (
@@ -282,54 +283,65 @@ def _validate_update_archive(archive_path, expected_version):
     return manifest
 
 
-def _current_extension_repository():
-    module_parts = __name__.split(".")
-    if len(module_parts) >= 3 and module_parts[0] == "bl_ext":
-        return module_parts[1]
-    return "user_default"
-
-
-def _update_install_command(archive_path, repository):
-    return [
-        bpy.app.binary_path,
-        "--background",
-        "--factory-startup",
-        "--command",
-        "extension",
-        "install-file",
-        "-r",
-        repository,
-        "-e",
-        str(pathlib.Path(archive_path).resolve()),
-    ]
-
-
-def _install_update_archive(archive_path, repository):
-    command = _update_install_command(archive_path, repository)
+def _install_update_archive(
+    archive_path,
+    *,
+    extension_root=None,
+):
+    root = pathlib.Path(extension_root or __file__).resolve()
+    if extension_root is None:
+        root = root.parent
+    package_files = (
+        "__init__.py",
+        "README.md",
+        "blender_manifest.toml",
+    )
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120.0,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise _UpdateError(
-            f"Cannot start Blender extension installer: {error}"
-        ) from error
-    if completed.returncode != 0:
-        details = (completed.stderr or completed.stdout).strip()
-        if details:
-            details = details.splitlines()[-1]
-            raise _UpdateError(f"Blender installer failed: {details}")
-        raise _UpdateError("Blender extension installer failed")
-    if "STATUS Reinstalled" not in completed.stdout and (
-        "STATUS Installed" not in completed.stdout
-    ):
-        raise _UpdateError("Blender did not confirm extension installation")
-    return completed.stdout
+        with zipfile.ZipFile(archive_path) as archive:
+            archive_names = {
+                name for name in archive.namelist() if not name.endswith("/")
+            }
+            if archive_names != set(package_files):
+                raise _UpdateError(
+                    "Update package contains an unexpected file set"
+                )
+            for name in package_files:
+                if not (root / name).is_file():
+                    raise _UpdateError(
+                        f"Installed extension is missing {name}"
+                    )
+
+            with tempfile.TemporaryDirectory(
+                prefix=f".{_ADDON_ID}_update_",
+                dir=root.parent,
+            ) as temporary_directory:
+                temporary_root = pathlib.Path(temporary_directory)
+                staged_root = temporary_root / "staged"
+                backup_root = temporary_root / "backup"
+                staged_root.mkdir()
+                backup_root.mkdir()
+                for name in package_files:
+                    staged_path = staged_root / name
+                    with archive.open(name) as source, staged_path.open(
+                        "wb"
+                    ) as destination:
+                        shutil.copyfileobj(source, destination)
+                    shutil.copy2(root / name, backup_root / name)
+
+                replaced = []
+                try:
+                    for name in package_files:
+                        os.replace(staged_root / name, root / name)
+                        replaced.append(name)
+                except OSError as error:
+                    for name in reversed(replaced):
+                        os.replace(backup_root / name, root / name)
+                    raise _UpdateError(
+                        f"Cannot replace extension files: {error}"
+                    ) from error
+    except (OSError, zipfile.BadZipFile) as error:
+        raise _UpdateError(f"Cannot install update package: {error}") from error
+    return package_files
 
 
 def _cross2(a, b):
@@ -2628,10 +2640,7 @@ class UV_OT_batch_knife_update(bpy.types.Operator):
                 update["latest_version"],
             )
 
-            _install_update_archive(
-                archive_path,
-                _current_extension_repository(),
-            )
+            _install_update_archive(archive_path)
 
             message = (
                 f"Installed {update['latest_version']}; restart Blender "

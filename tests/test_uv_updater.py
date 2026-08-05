@@ -73,27 +73,43 @@ license = ["SPDX:GPL-3.0-or-later"]
 """
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("blender_manifest.toml", manifest_text)
-        archive.writestr("__init__.py", "")
+        archive.writestr("__init__.py", "# updated package\n")
+        archive.writestr("README.md", "Updated package\n")
     manifest = addon._validate_update_archive(archive_path, "1.6.0")
     assert manifest["id"] == "uv_batch_knife"
     assert manifest["version"] == "1.6.0"
-    install_command = addon._update_install_command(
-        archive_path,
-        "user_default",
+    install_root = pathlib.Path(directory) / "installed_extension"
+    install_root.mkdir()
+    (install_root / "__init__.py").write_text(
+        "# old package\n",
+        encoding="utf-8",
     )
-    assert install_command[0] == bpy.app.binary_path
-    assert install_command[1:5] == [
-        "--background",
-        "--factory-startup",
-        "--command",
-        "extension",
-    ]
-    assert install_command[-4:] == [
-        "-r",
-        "user_default",
-        "-e",
-        str(archive_path.resolve()),
-    ]
+    (install_root / "README.md").write_text(
+        "Old package\n",
+        encoding="utf-8",
+    )
+    (install_root / "blender_manifest.toml").write_text(
+        manifest_text.replace('version = "1.6.0"', 'version = "1.5.3"'),
+        encoding="utf-8",
+    )
+    installed_files = addon._install_update_archive(
+        archive_path,
+        extension_root=install_root,
+    )
+    assert set(installed_files) == {
+        "__init__.py",
+        "README.md",
+        "blender_manifest.toml",
+    }
+    assert (install_root / "__init__.py").read_text("utf-8") == (
+        "# updated package\n"
+    )
+    assert (install_root / "README.md").read_text("utf-8") == (
+        "Updated package\n"
+    )
+    assert 'version = "1.6.0"' in (
+        install_root / "blender_manifest.toml"
+    ).read_text("utf-8")
 
 
 manifest = tomllib.loads((ROOT / "blender_manifest.toml").read_text("utf-8"))
